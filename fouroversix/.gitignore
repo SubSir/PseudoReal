@@ -1,0 +1,14 @@
+__pycache__
+*.py[cod]
+.DS_Store
+.vscode
+env/
+trace_*.json
+*.so
+exp/
+*.ipynb
+.cache/
+ptq_logs/
+dist/
+*.egg-info/
+site/
