@@ -11,6 +11,9 @@ import lm_eval
 from lm_eval.utils import make_table
 from lm_eval.models.huggingface import HFLM
 
+from inference_lib.src.fp_quant.utils.config import FPQuantConfig, FPQuantDtype
+from inference_lib.src.fp_quant.utils.replace import replace_with_fp_quant_linear, finalize_master_weights
+
 from src.metrics.perplexity import compute_perplexity
 from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
@@ -221,6 +224,11 @@ def parse_args():
         choices=["", "realquant", "pseudoquant"],
         help="Whether export quantized model in realquant or pseudoquant format.",
     )
+    parser.add_argument(
+        "--use_real_kernel",
+        action="store_true",
+        help="Whether to use real kernel for evaluation (only takes effect when loading exported model).",
+    )
     # GPTQ params
     parser.add_argument(
         "--gptq",
@@ -343,6 +351,50 @@ def parse_args():
     return args
 
 
+def _kernel_mode_to_pseudoquantization(kernel_mode: str) -> bool:
+    if kernel_mode == "pseudo":
+        return True
+    if kernel_mode == "real":
+        return False
+    raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'pseudo' or 'real'.")
+
+
+def _build_fp_quant_config_from_hf_config(hf_config, kernel_mode: str) -> FPQuantConfig:
+    if not hasattr(hf_config, "quantization_config") or hf_config.quantization_config is None:
+        raise ValueError("Model config has no `quantization_config`. Did you load an exported FP-Quant model?")
+
+    qcfg = hf_config.quantization_config
+    forward_dtype_str = qcfg.get("forward_dtype")
+    if forward_dtype_str == "mxfp4":
+        forward_dtype = FPQuantDtype.MXFP4
+    elif forward_dtype_str == "nvfp4":
+        forward_dtype = FPQuantDtype.NVFP4
+    else:
+        raise ValueError(f"Unsupported forward_dtype in quantization_config: {forward_dtype_str}")
+
+    return FPQuantConfig(
+        forward_dtype=forward_dtype,
+        forward_method=qcfg.get("forward_method", "abs_max"),
+        backward_dtype=FPQuantDtype.BF16,
+        store_master_weights=False,
+        hadamard_group_size=qcfg.get("hadamard_group_size", 128),
+        pseudoquantization=_kernel_mode_to_pseudoquantization(kernel_mode),
+        modules_to_not_convert=qcfg.get("modules_to_not_convert", ["lm_head"]),
+        transform_init="hadamard",
+    )
+
+
+def _maybe_enable_fp_quant_kernels(model, kernel_mode: str):
+    # 仅对已导出（带 quantization_config）的模型启用 inference_lib 的 FPQuantLinear
+    if not hasattr(model.config, "quantization_config") or model.config.quantization_config is None:
+        return model
+
+    fpq_config = _build_fp_quant_config_from_hf_config(model.config, kernel_mode=kernel_mode)
+    model, _ = replace_with_fp_quant_linear(model, fp_quant_linear_config=fpq_config)
+    finalize_master_weights(model)
+    return model
+
+
 def main():
     args = parse_args()
     # Fix seed
@@ -362,6 +414,10 @@ def main():
         device_map=None if args.cpu_offload_modules else device,
         low_cpu_mem_usage=True,
     )
+
+    # If loading an exported FP-Quant model, enable pseudo/real kernel for evaluation via a unified path.
+    kernel_mode = "real" if args.use_real_kernel else "pseudo"
+    model = _maybe_enable_fp_quant_kernels(model, kernel_mode=kernel_mode)
     model.config.use_cache = False
     model.requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)

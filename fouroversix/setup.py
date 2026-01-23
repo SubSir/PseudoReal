@@ -83,9 +83,9 @@ def get_cuda_gencodes() -> list[str]:
         if "120" in archs:
             # sm_120 is supported in CUDA 12.8/12.9+ toolkits
             if cuda_version >= Version("12.9"):
-                cc_flags += ["-gencode", "arch=compute_120f,code=sm_120"]
+                cc_flags += ["-gencode", "arch=compute_120a,code=sm_120a"]
             else:
-                cc_flags += ["-gencode", "arch=compute_120,code=sm_120"]
+                cc_flags += ["-gencode", "arch=compute_120a,code=sm_120a"]
 
     return cc_flags
 
@@ -213,7 +213,14 @@ if SKIP_CUDA_BUILD:
 
     ext_modules = None
 else:
-    if Path(".git").exists():
+    setup_dir = Path(__file__).parent
+
+    # CUTLASS can be provided either as a git submodule under third_party/cutlass
+    # (the default expected by this repo) or via an external path.
+    cutlass_dir_env = os.getenv("CUTLASS_DIR")
+    cutlass_dir = Path(cutlass_dir_env).expanduser().resolve() if cutlass_dir_env else None
+
+    if Path(".git").exists() and cutlass_dir is None:
         subprocess.run(
             [  # noqa: S607
                 "git",
@@ -224,10 +231,26 @@ else:
             ],
             check=True,
         )
-    elif not Path("third_party/cutlass").exists():
+
+    submodule_cutlass_dir = setup_dir / "third_party" / "cutlass"
+    if cutlass_dir is None:
+        cutlass_dir = submodule_cutlass_dir
+
+    cutlass_header = cutlass_dir / "include" / "cutlass" / "cutlass.h"
+
+    # Important: pip's editable install runs a "prepare_metadata_for_build_editable"
+    # step that executes setup.py in a subprocess. In some environments, user shell
+    # env vars (like CUTLASS_DIR) might not be present there, and we also don't want
+    # to hard-fail metadata generation.
+    #
+    # So we only hard-require CUTLASS at actual extension build time; metadata can be
+    # prepared without it.
+    if (not cutlass_header.exists()) and os.getenv("SETUPTOOLS_BUILD_META", "0") != "1":
         msg = (
-            "third_party/cutlass is missing, please use source distribution or git "
-            "clone"
+            "CUTLASS headers not found. Expected to find cutlass/cutlass.h at: "
+            f"{cutlass_header}. "
+            "Either initialize the git submodule at third_party/cutlass (git clone "
+            "--recursive) or set CUTLASS_DIR to your CUTLASS checkout root."
         )
         raise RuntimeError(msg)
 
@@ -237,7 +260,6 @@ else:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True  # noqa: SLF001
 
-    setup_dir = Path(__file__).parent
     kernels_dir = setup_dir / "src" / "fouroversix" / "csrc"
     sources = [
         path.relative_to(Path(__file__).parent).as_posix()
@@ -278,9 +300,9 @@ else:
             sources,
             extra_compile_args={"cxx": cxx_compile_args, "nvcc": nvcc_compile_args},
             include_dirs=[
-                setup_dir / "third_party/cutlass/examples/common",
-                setup_dir / "third_party/cutlass/include",
-                setup_dir / "third_party/cutlass/tools/util/include",
+                cutlass_dir / "examples/common",
+                cutlass_dir / "include",
+                cutlass_dir / "tools/util/include",
                 kernels_dir / "include",
             ],
         ),

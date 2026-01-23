@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
 import torch.nn as nn  # noqa: PLR0402
 from fouroversix.utils import AdaptiveBlockScalingRule, FP4Format
 
@@ -47,3 +48,5 @@ def quantize_model(
         fp4_linear.apply_ptq()
 
         model.set_submodule(name, fp4_linear)
+        del module
+        torch.cuda.empty_cache()
