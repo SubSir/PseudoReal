@@ -4,7 +4,11 @@ import numpy as np
 import gc
 
 import sys
-sys.path.append('kernels/build/')
+import os
+
+_KERNEL_BUILD_DIR = os.path.join(os.path.dirname(__file__), "..", "kernels", "build")
+if _KERNEL_BUILD_DIR not in sys.path:
+    sys.path.append(_KERNEL_BUILD_DIR)
 import agemm 
 
 import math

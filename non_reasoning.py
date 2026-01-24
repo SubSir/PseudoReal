@@ -9,18 +9,55 @@ import torch.nn as nn
 
 from fouroversix import apply_ptq, QuantizeBackend
 
+import os
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "FP-Quant", "inference_lib", "src"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "FP-Quant"))
+
+from fp_quant.utils.config import FPQuantConfig, FPQuantDtype
+from fp_quant.utils.replace import replace_quantize_with_fp_quant_linear, finalize_master_weights
+
+from safetensors.torch import load_file
+
+
 def load_model(
-    model_path: str, device_map: str | None = None, dtype=torch.float32, **kwargs
-) -> nn.Module:
+    model_path: str,
+    device_map: str | None = None,
+    dtype=torch.float32,
+    *,
+    ignore_fp_quant_in_config: bool = False,
+    **kwargs,
+) -> tuple[nn.Module, dict | None]:
+    # When loading an exported FP-Quant model directory, transformers may auto-enable
+    # its own FP-Quant integration via `config.quantization_config`, which can trigger
+    # pre_forward() on CPU during load (and crash). We want to control kernel selection
+    # ourselves, so we optionally strip quantization_config before model instantiation.
+    if ignore_fp_quant_in_config:
+        from transformers import AutoConfig
+
+        # Keep the exported quantization_config for our manual fp_quant path,
+        # but remove it from `config` passed into transformers to avoid auto-quantization.
+        cfg_full = AutoConfig.from_pretrained(model_path)
+        if hasattr(cfg_full, "quantization_config"):
+            kwargs["_fp_quant_export_config"] = cfg_full.quantization_config
+            delattr(cfg_full, "quantization_config")
+        kwargs["config"] = cfg_full
+
+    export_qcfg = kwargs.get("_fp_quant_export_config", None)
+    if "_fp_quant_export_config" in kwargs:
+        del kwargs["_fp_quant_export_config"]
+
     if device_map is None:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=dtype, **kwargs
-        )
+        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype, **kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, device_map=device_map, torch_dtype=dtype, **kwargs
+            model_path,
+            device_map=device_map,
+            torch_dtype=dtype,
+            **kwargs,
         )
-    return model
+    return model, export_qcfg
 
 
 def _evaluate(model: nn.Module, tokenizer, *, batch_size: int) -> dict:
@@ -34,6 +71,158 @@ def _evaluate(model: nn.Module, tokenizer, *, batch_size: int) -> dict:
     return results["results"]
 
 
+def _kernel_mode_to_pseudoquantization(kernel_mode: str) -> bool:
+    v = kernel_mode.strip().lower()
+    if v in {"pseudo", "ref", "reference"}:
+        return True
+    if v in {"real", "kernel", "kernels"}:
+        return False
+    raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'pseudo' or 'real'.")
+
+
+def _build_fp_quant_config_from_hf_config(hf_config, kernel_mode: str) -> FPQuantConfig:
+    # Support passing either a full HF config (with `.quantization_config`) or directly
+    # a quantization_config dict (export metadata).
+    if isinstance(hf_config, dict):
+        qcfg = hf_config
+    else:
+        if not hasattr(hf_config, "quantization_config") or hf_config.quantization_config is None:
+            raise ValueError(
+                "Model config has no `quantization_config`. Please point --model to an exported FP-Quant model."
+            )
+        qcfg = hf_config.quantization_config
+
+
+    forward_dtype_str = qcfg.get("forward_dtype")
+    if forward_dtype_str == "mxfp4":
+        forward_dtype = FPQuantDtype.MXFP4
+    elif forward_dtype_str == "nvfp4":
+        forward_dtype = FPQuantDtype.NVFP4
+    else:
+        raise ValueError(f"Unsupported forward_dtype in quantization_config: {forward_dtype_str}")
+
+    return FPQuantConfig(
+        forward_dtype=forward_dtype,
+        forward_method=qcfg.get("forward_method", "abs_max"),
+        backward_dtype=FPQuantDtype.BF16,
+        store_master_weights=False,
+        hadamard_group_size=qcfg.get("hadamard_group_size", 128),
+        pseudoquantization=_kernel_mode_to_pseudoquantization(kernel_mode),
+        modules_to_not_convert=qcfg.get("modules_to_not_convert", ["lm_head"]),
+        transform_init="hadamard",
+    )
+
+
+def _load_fp_quant_model(
+    model_path: str,
+    *,
+    kernel_mode: str,
+    device: str,
+    dtype: torch.dtype,
+) -> tuple[nn.Module, AutoTokenizer | None]:
+    # Load config and keep export quantization metadata
+    from transformers import AutoConfig
+
+    cfg_full = AutoConfig.from_pretrained(model_path)
+    export_qcfg = getattr(cfg_full, "quantization_config", None)
+    if export_qcfg is None:
+        raise ValueError(
+            "Exported model is missing `quantization_config` in config.json. "
+            "Please re-export with FP-Quant export enabled."
+        )
+
+    # Avoid transformers auto-quantization during load
+    delattr(cfg_full, "quantization_config")
+
+    fpq_config = _build_fp_quant_config_from_hf_config(export_qcfg, kernel_mode=kernel_mode)
+
+    # Build model directly on target device (single-GPU, no meta/accelerate).
+    model = AutoModelForCausalLM.from_config(cfg_full)
+    model.to(device)
+    model.eval()
+
+    # Replace Linear -> FPQuantLinear on-device
+    model = replace_quantize_with_fp_quant_linear(model, fp_quant_linear_config=fpq_config)
+
+    # Load exported weights (qweight/scales/dqweight/...) into the replaced modules
+    state_dict = {}
+    shard_paths = [
+        os.path.join(model_path, f"model-{i}-of-4.safetensors") for i in range(1, 5)
+    ]
+    for sp in shard_paths:
+        if not os.path.isfile(sp):
+            raise FileNotFoundError(f"Missing shard: {sp}")
+        state_dict.update(load_file(sp))
+
+    model.load_state_dict(state_dict, strict=False)
+
+    finalize_master_weights(model)
+    model.eval()
+    return model, None
+
+
+def _apply_arcquant(
+    model: nn.Module,
+    *,
+    model_path: str,
+    kernel_mode: str,
+    dataset: str = "wikitext2",
+    act_sort_metric: str = "max",
+    kv_cache: bool = False,
+    quant_type: str = "NVFP4",
+):
+    kernel_mode = kernel_mode.strip().lower()
+    if kernel_mode not in {"real", "pseudo"}:
+        raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
+
+    arc_root = os.path.join(os.path.dirname(__file__), "ARCQuant")
+    arc_model_dir = os.path.join(arc_root, "model")
+    if arc_model_dir not in sys.path:
+        sys.path.append(arc_model_dir)
+
+    from model_utils import reorder_model_llama, reorder_model_qwen  # type: ignore
+
+    model_name = model_path.rstrip("/").split("/")[-1]
+    dataset_name = dataset.lower()
+    metric = act_sort_metric
+
+    saved_dir = os.path.join(arc_root, "saved")
+    index_filename = os.path.join(saved_dir, f"{model_name.lower()}_reorder_index_{dataset_name}_{metric}.pt")
+    select_num_filename = os.path.join(saved_dir, f"{model_name.lower()}_select_num_{dataset_name}_{metric}.pt")
+    act_scales_filename = os.path.join(saved_dir, f"{model_name.lower()}_act_scales_{dataset_name}_{metric}.pt")
+
+    if not os.path.isfile(index_filename):
+        raise FileNotFoundError(
+            f"ARCQuant reorder index file not found: {index_filename}. "
+            f"Please run: python ARCQuant/reorder_indices.py --model {model_path} --dataset {dataset} --act_sort_metric {act_sort_metric} --samples 128 --seqlen 2048"
+        )
+    if not os.path.isfile(select_num_filename):
+        raise FileNotFoundError(f"ARCQuant select_num file not found: {select_num_filename}")
+    if not os.path.isfile(act_scales_filename):
+        raise FileNotFoundError(f"ARCQuant act_scales file not found: {act_scales_filename}")
+
+    reorder_index = torch.load(index_filename, weights_only=False)
+    select_nums = torch.load(select_num_filename, weights_only=False)
+
+    if "llama" in model_path.lower():
+        reorder_model_func = reorder_model_llama
+    elif "qwen" in model_path.lower():
+        reorder_model_func = reorder_model_qwen
+    else:
+        raise ValueError(f"ARCQuant backend currently supports Llama/Qwen only. Got model path: {model_path}")
+
+    model.config.use_cache = False
+    model = reorder_model_func(
+        model,
+        device="cuda",
+        kv_cache=kv_cache,
+        reorder_index=reorder_index,
+        select_nums=select_nums,
+        quant_type=quant_type,
+        kernel_mode=kernel_mode,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -43,24 +232,30 @@ def main():
         default="SubSir/Meta-Llama-3-8B",
     )
     parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--batch-size", default=16, type=int)
+    parser.add_argument("--batch-size", default=8, type=int)
+
     parser.add_argument(
-        "--ptq-backend-1",
+        "--backend",
+        type=str,
+        default="4o6",
+        choices=["4o6", "fp_quant", "arcquant"],
+        help="Which quantization/eval backend to compare: 4o6 (fouroversix PTQ), fp_quant (exported FP-Quant model), or arcquant (ARCQuant/AGEMM).",
+    )
+
+    # Run-1 / Run-2 kernel selection
+    # - For backend=4o6: controls fouroversix quantize backend mapping (real->triton, pseudo->pytorch)
+    # - For backend=fp_quant: controls FPQuantLinear pseudoquantization flag (real/pseudo)
+    parser.add_argument(
+        "--kernel-1",
         default="real",
         type=str,
-        help=(
-            "Backend for first apply_ptq run. One of: auto/none, real, pseudo, "
-            "pytorch, triton, transformer_engine, cuda."
-        ),
+        help="Kernel mode for run 1: real or pseudo.",
     )
     parser.add_argument(
-        "--ptq-backend-2",
+        "--kernel-2",
         default="pseudo",
         type=str,
-        help=(
-            "Backend for second apply_ptq run. One of: auto/none, real, pseudo, "
-            "pytorch, triton, transformer_engine, cuda."
-        ),
+        help="Kernel mode for run 2: real or pseudo.",
     )
 
     args = parser.parse_args()
@@ -86,42 +281,89 @@ def main():
             return QuantizeBackend.pytorch
         return QuantizeBackend(v)
 
-    backend1 = _parse_backend(args.ptq_backend_1)
-    backend2 = _parse_backend(args.ptq_backend_2)
+    def _parse_kernel_mode(val: str) -> str:
+        v = val.strip().lower()
+        if v in {"real", "kernel", "kernels"}:
+            return "real"
+        if v in {"pseudo", "ref", "reference"}:
+            return "pseudo"
+        raise ValueError(f"Invalid kernel mode: {val}. Expected 'real' or 'pseudo'.")
+
+    kernel1 = _parse_kernel_mode(args.kernel_1)
+    kernel2 = _parse_kernel_mode(args.kernel_2)
+
+    # Only used when backend=4o6
+    backend1 = _parse_backend(kernel1)
+    backend2 = _parse_backend(kernel2)
 
     print("Run 1: loading model...")
-    model1 = load_model(args.model, device_map=device, dtype=dtype)
-    model1.to(device)
-    model1.eval()
-
-    if backend1 is not None:
-        print(f"Run 1: apply_ptq (backend={backend1}) ...")
+    ignore_fp_quant_in_config = args.backend == "fp_quant"
+    if args.backend == "fp_quant":
+        model1, _ = _load_fp_quant_model(args.model, kernel_mode=kernel1, device=device, dtype=dtype)
     else:
-        print("Run 1: apply_ptq (backend=auto) ...")
-    apply_ptq(model1, quantize_backend=backend1)
+        model1, _ = load_model(
+            args.model,
+            device_map=device,
+            dtype=dtype,
+            ignore_fp_quant_in_config=ignore_fp_quant_in_config,
+        )
+        model1.to(device)
+        model1.eval()
+
+    if args.backend == "4o6":
+        if backend1 is not None:
+            print(f"Run 1: apply_ptq (backend={backend1}) ...")
+        else:
+            print("Run 1: apply_ptq (backend=auto) ...")
+        apply_ptq(model1, quantize_backend=backend1)
+    elif args.backend == "fp_quant":
+        print(f"Run 1: enable FP-Quant kernels (kernel_mode={kernel1}) ...")
+        # Already loaded as FP-Quant model above.
+    elif args.backend == "arcquant":
+        print(f"Run 1: enable ARCQuant (kernel_mode={kernel1}) ...")
+        _apply_arcquant(model1, model_path=args.model, kernel_mode=kernel1)
+    else:
+        raise ValueError(f"Unknown backend: {args.backend}")
 
     print("Run 1: evaluating...")
     results1 = _evaluate(model1, tokenizer, batch_size=args.batch_size)
-    print({"run": 1, "ptq_backend": args.ptq_backend_1, "results": results1})
+    print({"run": 1, "backend": args.backend, "kernel": kernel1, "results": results1})
 
     del model1
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     print("Run 2: loading model...")
-    model2 = load_model(args.model, device_map=device, dtype=dtype)
-    model2.to(device)
-    model2.eval()
-
-    if backend2 is not None:
-        print(f"Run 2: apply_ptq (backend={backend2}) ...")
+    if args.backend == "fp_quant":
+        model2, _ = _load_fp_quant_model(args.model, kernel_mode=kernel2, device=device, dtype=dtype)
     else:
-        print("Run 2: apply_ptq (backend=auto) ...")
-    apply_ptq(model2, quantize_backend=backend2)
+        model2, _ = load_model(
+            args.model,
+            device_map=device,
+            dtype=dtype,
+            ignore_fp_quant_in_config=ignore_fp_quant_in_config,
+        )
+        model2.to(device)
+        model2.eval()
+
+    if args.backend == "4o6":
+        if backend2 is not None:
+            print(f"Run 2: apply_ptq (backend={backend2}) ...")
+        else:
+            print("Run 2: apply_ptq (backend=auto) ...")
+        apply_ptq(model2, quantize_backend=backend2)
+    elif args.backend == "fp_quant":
+        print(f"Run 2: enable FP-Quant kernels (kernel_mode={kernel2}) ...")
+        # Already loaded as FP-Quant model above.
+    elif args.backend == "arcquant":
+        print(f"Run 2: enable ARCQuant (kernel_mode={kernel2}) ...")
+        _apply_arcquant(model2, model_path=args.model, kernel_mode=kernel2)
+    else:
+        raise ValueError(f"Unknown backend: {args.backend}")
 
     print("Run 2: evaluating...")
     results2 = _evaluate(model2, tokenizer, batch_size=args.batch_size)
-    print({"run": 2, "ptq_backend": args.ptq_backend_2, "results": results2})
+    print({"run": 2, "backend": args.backend, "kernel": kernel2, "results": results2})
 
 
 if __name__ == "__main__":

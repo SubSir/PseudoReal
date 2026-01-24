@@ -59,6 +59,10 @@ class FPQuantLinear(nn.Module):
                 "QuTLASS is not installed. Can only run with `pseudoquantization=True` in the quantization config. If you have a Blackwell GPU, you can install QuTLASS from https://github.com/IST-DASLab/QuTLASS"
             )
 
+        # If we are in pseudo mode and loading from an exported checkpoint, we may want to keep
+        # the exported dqweight (instead of recomputing it in pre_forward).
+        self._prefer_exported_dqweight = False
+
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
         self.out_features = out_features
@@ -74,6 +78,32 @@ class FPQuantLinear(nn.Module):
             self.register_parameter("bias", None)
 
         self.config = config
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+        # If checkpoint provides dqweight, and we are in pseudo mode, keep it and skip recomputation.
+        dq_key = prefix + "dqweight"
+        if self.config.pseudoquantization and dq_key in state_dict:
+            self._prefer_exported_dqweight = True
+
 
         # Quantized tensors buffers
         if self.config.forward_dtype == FPQuantDtype.MXFP4:
@@ -151,6 +181,7 @@ class FPQuantLinear(nn.Module):
             ),
         )
 
+
     @torch.no_grad()
     def pre_forward(self):
         # Generate rotation matrices
@@ -221,6 +252,7 @@ class FPQuantLinear(nn.Module):
             self.scales = None
             self.dqweight = None
         elif self.config.pseudoquantization:
+            if not self._prefer_exported_dqweight:
             weight_dq, _ = forward_pseudoquantize(
                 self.weight.data,
                 self.forward_hadamard_matrix,

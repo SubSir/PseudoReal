@@ -24,7 +24,11 @@ include_directories(${Python3_INCLUDE_DIRS})
 find_package(pybind11 CONFIG REQUIRED)
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS ${TORCH_CMAKE_PREFIX_PATH}/../../lib/ NO_DEFAULT_PATH)
 
-set(CUTLASS_ROOT ../third-party/cutlass)
+if(DEFINED ENV{CUTLASS_DIR} AND NOT "$ENV{CUTLASS_DIR}" STREQUAL "")
+  set(CUTLASS_ROOT $ENV{CUTLASS_DIR})
+else()
+  set(CUTLASS_ROOT ../third-party/cutlass)
+endif()
 
 include_directories(./include)
 include_directories(/usr/local/cuda/include)

@@ -38,14 +38,13 @@ DATASET_LOADERS = {
 }
         
 def main():
-    model, enc = load_model(args.model)
+    model, enc = load_model(args.model, device="cuda:0")
     folder_path = "./saved"
     path = args.model.rstrip('/')
     model_name = path.split('/')[-1]
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
 
-    os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'
     start_time = time.time()
     
     print(f"Using {args.dataset} dataset for calibration.")

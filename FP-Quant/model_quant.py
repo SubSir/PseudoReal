@@ -115,7 +115,7 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
     config.quantization_config = prepare_quantization_config(
         args.hadamard_group_size, 
         args.format,
-        pseudoquantization=(args.export_quantized_model == "pseudoquant")
+        pseudoquantization=False
     )
     # Save configs
     config.save_pretrained(args.save_path)
@@ -221,8 +221,8 @@ def parse_args():
         "--export_quantized_model",
         type=str,
         default="",
-        choices=["", "realquant", "pseudoquant"],
-        help="Whether export quantized model in realquant or pseudoquant format.",
+        choices=["", "realquant"],
+        help="Whether export quantized model (single-weight export: always realquant).",
     )
     parser.add_argument(
         "--use_real_kernel",

@@ -16,7 +16,7 @@ from functools import partial
 import math
 
 
-def reorder_model_llama(model, device, kv_cache, reorder_index, select_nums, quant_type):
+def reorder_model_llama(model, device, kv_cache, reorder_index, select_nums, quant_type, kernel_mode: str = "real"):
     model.config.use_cache = False
     layers = model.model.layers
     assert reorder_index is not None, "Reorder index is None"
@@ -30,8 +30,12 @@ def reorder_model_llama(model, device, kv_cache, reorder_index, select_nums, qua
                 select_nums=select_nums,
                 reorder_index=reorder_index,
                 layer_idx=i,
-                quant_type=quant_type
+                quant_type=quant_type,
+                kernel_mode=kernel_mode,
             )
+            # transformers 新版本：rotary_emb 在 model 层（model.model.rotary_emb），不在 Attention 上
+            if getattr(m.self_attn, "rotary_emb", None) is None and hasattr(model.model, "rotary_emb"):
+                m.self_attn.rotary_emb = model.model.rotary_emb
         elif isinstance(layers[i], QLlamaDecoderLayer):
             m = layers[i]
             
@@ -40,13 +44,14 @@ def reorder_model_llama(model, device, kv_cache, reorder_index, select_nums, qua
         m.mlp.register_buffer('down_reorder_index', reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')].to(torch.int16))
         m.self_attn.register_buffer('q_reorder_index', reorder_index[nameTemplate.format(i, 'self_attn', 'q_proj', 'input')].to(torch.int16))
         m.self_attn.register_buffer('o_reorder_index', reorder_index[nameTemplate.format(i, 'self_attn', 'o_proj', 'input')].to(torch.int16))
-        layers[i] = layers[i].cpu()
-        layers[i] = m.cpu()
+        # 保持 ARCQuant 重排后的 layer 常驻在 GPU。
+        # 否则后续评测 forward 时，会出现权重在 CPU、hidden_states 在 CUDA 的 device mismatch。
+        layers[i] = m.to(device)
         del m
         torch.cuda.empty_cache()
     return model
 
-def reorder_model_qwen(model, device, kv_cache, reorder_index, select_nums, quant_type):
+def reorder_model_qwen(model, device, kv_cache, reorder_index, select_nums, quant_type, kernel_mode: str = "real"):
     model.config.use_cache = False
     layers = model.model.layers
     assert reorder_index is not None, "Reorder index is None"
@@ -60,7 +65,8 @@ def reorder_model_qwen(model, device, kv_cache, reorder_index, select_nums, quan
                 select_nums=select_nums,
                 reorder_index=reorder_index,
                 layer_idx=i,
-                quant_type=quant_type
+                quant_type=quant_type,
+                kernel_mode=kernel_mode,
             )
             
         nameTemplate = 'layers.{}.{}.{}.{}'

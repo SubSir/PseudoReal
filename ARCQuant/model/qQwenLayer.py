@@ -8,7 +8,10 @@ from quantize import *
 from visualize import *
 import os
 import sys
-sys.path.append('kernels/build/')
+
+_KERNEL_BUILD_DIR = os.path.join(os.path.dirname(__file__), "..", "kernels", "build")
+if _KERNEL_BUILD_DIR not in sys.path:
+    sys.path.append(_KERNEL_BUILD_DIR)
 import agemm 
 
 import matplotlib.pyplot as plt
@@ -74,13 +77,19 @@ def NVFP4_reorder_quantize_x(x, reorder_index, select_num):
     qx, scale_x = agemm.reorder_quantize_x(x/scale, reorder_index, select_num)
     return qx, scale_x, scale
 
-def reorder_quantize_x(x, reorder_index, select_num, quant_type='NVFP4'):
-    if quant_type == 'NVFP4':
-        # return NVFP4_reorder_quantize_x(x, torch.arange(reorder_index.shape[0]).to(torch.int16).cuda(), 0)
+def reorder_quantize_x(x, reorder_index, select_num, quant_type='NVFP4', kernel_mode: str = "real"):
+    kernel_mode = kernel_mode.strip().lower()
+    if kernel_mode not in {"real", "pseudo"}:
+        raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
+
+    if quant_type == 'NVFP4' and kernel_mode == "real":
         return NVFP4_reorder_quantize_x(x, reorder_index, select_num)
-    else:
-        index = reorder_index.to(torch.int32)
-        return fake_reorder_quantize_x(torch.index_select(x, 1, index), torch.arange(x.shape[-1]), select_num, dtype=quant_type)
+
+    if quant_type == 'NVFP4' and kernel_mode == "pseudo":
+        return fake_reorder_quantize_x((x), torch.arange(x.shape[-1]), select_num, dtype='NVFP4')
+
+    index = reorder_index.to(torch.int32)
+    return fake_reorder_quantize_x(torch.index_select(x, 1, index), torch.arange(x.shape[-1]), select_num, dtype=quant_type)
 
         
 class QQwen2RMSNorm(nn.Module):
@@ -111,17 +120,22 @@ class QQwen2DecoderLayer(nn.Module):
         select_nums,
         reorder_index,
         layer_idx,
-        quant_type
+        quant_type,
+        kernel_mode: str = "real",
     ):
         super().__init__()
         self.hidden_size = originalLayer.hidden_size
+        self.kernel_mode = kernel_mode.strip().lower()
+        if self.kernel_mode not in {"real", "pseudo"}:
+            raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
         self.self_attn = QQwen2Attention(
             originalLayer.self_attn,
             kv_cache,
             select_nums=select_nums,
             reorder_index=reorder_index,
             i=layer_idx,
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         # self.self_attn = originalLayer.self_attn
         self.mlp = QQwen2MLP(
@@ -129,7 +143,8 @@ class QQwen2DecoderLayer(nn.Module):
             select_nums=select_nums,
             reorder_index=reorder_index,
             i=layer_idx,
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.input_layernorm = QQwen2RMSNorm(
             originalLayer.input_layernorm, 
@@ -202,11 +217,15 @@ class QQwen2Attention(nn.Module):
         select_nums,
         reorder_index,
         i,
-        quant_type
+        quant_type,
+        kernel_mode: str = "real",
     ):
         super().__init__()
         self.layer_idx = i
         self.quant_type = quant_type
+        self.kernel_mode = kernel_mode.strip().lower()
+        if self.kernel_mode not in {"real", "pseudo"}:
+            raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
         self.q_kv_cache = kv_cache
         self.config = originalAttn.config
         self.hidden_size = originalAttn.hidden_size
@@ -228,25 +247,29 @@ class QQwen2Attention(nn.Module):
             originalAttn.q_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'q_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'q_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.k_proj = QLinearLayer(
             originalAttn.k_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'k_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'k_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.v_proj = QLinearLayer(
             originalAttn.v_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'v_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'v_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.o_proj = QLinearLayer(
             originalAttn.o_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'o_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'o_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.rotary_emb = originalAttn.rotary_emb
 
@@ -279,7 +302,7 @@ class QQwen2Attention(nn.Module):
 
         hidden_states = hidden_states.reshape(bsz*q_len, -1).contiguous().detach()
         # print(self.q_proj.select_num)
-        qx, scale_x, scale = reorder_quantize_x(hidden_states, self.q_reorder_index, self.q_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(hidden_states, self.q_reorder_index, self.q_proj.select_num, self.quant_type, self.kernel_mode)
         torch.cuda.synchronize()
         
         hidden_states = (qx, scale_x, scale, bsz, q_len)
@@ -348,7 +371,7 @@ class QQwen2Attention(nn.Module):
        
         attn_output = attn_output.reshape(bsz*q_len, -1).contiguous().detach()
 
-        qx, scale_x, scale = reorder_quantize_x(attn_output, self.o_reorder_index, self.o_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(attn_output, self.o_reorder_index, self.o_proj.select_num, self.quant_type, self.kernel_mode)
         torch.cuda.synchronize()
         attn_output = (qx, scale_x, scale, bsz, q_len)
         attn_output = self.o_proj(attn_output)
@@ -366,31 +389,38 @@ class QQwen2MLP(nn.Module):
         select_nums,
         reorder_index,
         i,
-        quant_type
+        quant_type,
+        kernel_mode: str = "real",
     ):
         super().__init__()
         
         nameTemplate = 'layers.{}.{}.{}.{}'
         self.quant_type = quant_type
+        self.kernel_mode = kernel_mode.strip().lower()
+        if self.kernel_mode not in {"real", "pseudo"}:
+            raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
         self.gate_proj = QLinearLayer(
             originalMLP.gate_proj,
             select_num=select_nums[nameTemplate.format(i, 'mlp', 'gate_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'gate_proj', 'input')],
             out_reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.down_proj = QLinearLayer(
             originalMLP.down_proj,
             select_num=select_nums[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.up_proj = QLinearLayer(
             originalMLP.up_proj,
             select_num=select_nums[nameTemplate.format(i, 'mlp', 'up_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'up_proj', 'input')],
             out_reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.act_fn = originalMLP.act_fn
 
@@ -411,7 +441,7 @@ class QQwen2MLP(nn.Module):
         bsz, q_len, _ = x.shape
         x = x.reshape(bsz*q_len, -1).contiguous().detach()
 
-        qx, scale_x, scale = reorder_quantize_x(x, self.up_reorder_index, self.up_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(x, self.up_reorder_index, self.up_proj.select_num, self.quant_type, self.kernel_mode)
         torch.cuda.synchronize()
         x = (qx, scale_x, scale, bsz, q_len)
         tmpResult = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
@@ -420,7 +450,7 @@ class QQwen2MLP(nn.Module):
         bsz, q_len, _ = tmpResult.shape
         tmpResult = tmpResult.reshape(bsz*q_len, -1).contiguous().detach()
         
-        qx, scale_x, scale = reorder_quantize_x(tmpResult, self.down_reorder_index, self.down_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(tmpResult, self.down_reorder_index, self.down_proj.select_num, self.quant_type, self.kernel_mode)
         
         tmpResult = (qx, scale_x, scale, bsz, q_len)
        

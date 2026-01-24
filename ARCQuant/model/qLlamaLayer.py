@@ -8,7 +8,10 @@ from quantize import *
 from visualize import *
 import os
 import sys
-sys.path.append('kernels/build/')
+
+_KERNEL_BUILD_DIR = os.path.join(os.path.dirname(__file__), "..", "kernels", "build")
+if _KERNEL_BUILD_DIR not in sys.path:
+    sys.path.append(_KERNEL_BUILD_DIR)
 import agemm 
 
 import matplotlib.pyplot as plt
@@ -76,14 +79,20 @@ def NVFP4_reorder_quantize_x(x, reorder_index, select_num):
     qx, scale_x = agemm.reorder_quantize_x(x/scale, reorder_index, select_num)
     return qx, scale_x, scale
 
-def reorder_quantize_x(x, reorder_index, select_num, quant_type='NVFP4'):
-    if quant_type == 'NVFP4':
-        # return NVFP4_reorder_quantize_x(hadamard_transform(x), torch.arange(reorder_index.shape[0]).to(torch.int16).cuda(), 0)
+def reorder_quantize_x(x, reorder_index, select_num, quant_type='NVFP4', kernel_mode: str = "real"):
+    kernel_mode = kernel_mode.strip().lower()
+    if kernel_mode not in {"real", "pseudo"}:
+        raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
+
+    if quant_type == 'NVFP4' and kernel_mode == "real":
         return NVFP4_reorder_quantize_x(x, reorder_index, select_num)
-    else:
-        index = reorder_index.to(torch.int32)
-        return fake_reorder_quantize_x((x), torch.arange(x.shape[-1]), 0, dtype=quant_type)
-        # return fake_reorder_quantize_x(torch.index_select(x, 1, index), torch.arange(x.shape[-1]), select_num, dtype=quant_type)
+
+    if quant_type == 'NVFP4' and kernel_mode == "pseudo":
+        return fake_reorder_quantize_x((x), torch.arange(x.shape[-1]), select_num, dtype='NVFP4')
+
+    index = reorder_index.to(torch.int32)
+    return fake_reorder_quantize_x((x), torch.arange(x.shape[-1]), 0, dtype=quant_type)
+    # return fake_reorder_quantize_x(torch.index_select(x, 1, index), torch.arange(x.shape[-1]), select_num, dtype=quant_type)
 
 class QLlamaDecoderLayer(nn.Module):
     def __init__(
@@ -94,17 +103,22 @@ class QLlamaDecoderLayer(nn.Module):
         reorder_index,
         layer_idx,
         quant_type,
+        kernel_mode: str = "real",
     ):
         super().__init__()
        
         self.hidden_size = originalLayer.hidden_size
+        self.kernel_mode = kernel_mode.strip().lower()
+        if self.kernel_mode not in {"real", "pseudo"}:
+            raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
         self.self_attn = QLlamaAttention(
             originalLayer.self_attn,
             kv_cache,
             select_nums=select_nums,
             reorder_index=reorder_index,
             i=layer_idx,
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         # self.self_attn = originalLayer.self_attn
         self.mlp = QLlamaMLP(
@@ -112,7 +126,8 @@ class QLlamaDecoderLayer(nn.Module):
             select_nums=select_nums,
             reorder_index=reorder_index,
             i=layer_idx,
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         # self.mlp = originalLayer.mlp
         self.input_layernorm = QLlamaRMSNorm(
@@ -139,21 +154,26 @@ class QLlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[object] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
         
         # Self Attention
+        # transformers 新版 forward 里参数名从 past_key_value -> past_key_values
+        pkv = past_key_values if past_key_values is not None else past_key_value
+
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_value=pkv,
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -175,7 +195,7 @@ class QLlamaDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        return outputs
+        return hidden_states
     
    
         
@@ -214,20 +234,58 @@ class QLlamaAttention(nn.Module):
         select_nums,
         reorder_index,
         i,
-        quant_type
+        quant_type,
+        kernel_mode: str = "real",
     ):
         super().__init__()
         self.q_kv_cache = kv_cache
         self.config = originalAttn.config
-        self.hidden_size = originalAttn.hidden_size
-        self.num_heads = originalAttn.num_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = originalAttn.num_key_value_heads
-        self.num_key_value_groups = originalAttn.num_key_value_groups
-        self.max_position_embeddings = originalAttn.max_position_embeddings
-        self.rope_theta = originalAttn.rope_theta
+
+        # transformers 新版本里 LlamaAttention 不再暴露 hidden_size/num_heads 等字段，
+        # 需要从 config / proj weight 里推导，保持与 origin_llama.py 一致。
+        self.hidden_size = getattr(originalAttn, "hidden_size", None)
+        if self.hidden_size is None:
+            self.hidden_size = getattr(self.config, "hidden_size", None)
+        if self.hidden_size is None and hasattr(originalAttn, "q_proj"):
+            # q_proj: [num_attention_heads * head_dim, hidden_size]
+            self.hidden_size = originalAttn.q_proj.in_features
+        if self.hidden_size is None:
+            raise AttributeError("Cannot infer hidden_size from LlamaAttention; please check transformers version.")
+
+        self.num_heads = (
+            getattr(originalAttn, "num_heads", None)
+            or getattr(self.config, "num_attention_heads", None)
+        )
+        if self.num_heads is None:
+            raise AttributeError("Cannot infer num_heads from LlamaAttention/config.")
+
+        # head_dim 在新版本里可能存在于 config.head_dim
+        self.head_dim = getattr(originalAttn, "head_dim", None)
+        if self.head_dim is None:
+            self.head_dim = getattr(self.config, "head_dim", self.hidden_size // self.num_heads)
+
+        self.num_key_value_heads = (
+            getattr(originalAttn, "num_key_value_heads", None)
+            or getattr(self.config, "num_key_value_heads", None)
+            or self.num_heads
+        )
+        self.num_key_value_groups = (
+            getattr(originalAttn, "num_key_value_groups", None)
+            or (self.num_heads // self.num_key_value_heads)
+        )
+
+        self.max_position_embeddings = (
+            getattr(originalAttn, "max_position_embeddings", None)
+            or getattr(self.config, "max_position_embeddings", None)
+        )
+        self.rope_theta = getattr(originalAttn, "rope_theta", None)
+        if self.rope_theta is None:
+            self.rope_theta = getattr(self.config, "rope_theta", None)
         self.layer_idx = i
         self.quant_type = quant_type
+        self.kernel_mode = kernel_mode.strip().lower()
+        if self.kernel_mode not in {"real", "pseudo"}:
+            raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
@@ -239,30 +297,35 @@ class QLlamaAttention(nn.Module):
             originalAttn.q_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'q_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'q_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.k_proj = QLinearLayer(
             originalAttn.k_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'k_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'k_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.v_proj = QLinearLayer(
             originalAttn.v_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'v_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'v_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.o_proj = QLinearLayer(
             originalAttn.o_proj,
             select_num=select_nums[nameTemplate.format(i, 'self_attn', 'o_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'self_attn', 'o_proj', 'input')],
-            quant_type=quant_type
+            quant_type=quant_type,
+            kernel_mode=self.kernel_mode,
         )
-        self.rotary_emb = originalAttn.rotary_emb
+        # transformers 新版本里 rotary_emb 不在 Attention 上，而是在 LlamaModel 上统一持有。
+        # 这里优先复用 originalAttn.rotary_emb（老版本），否则由上层通过 set_rotary_emb 注入。
+        self.rotary_emb = getattr(originalAttn, "rotary_emb", None)
 
-
-        self.attention_dropout=originalAttn.attention_dropout
+        self.attention_dropout = getattr(originalAttn, "attention_dropout", 0.0)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -284,23 +347,25 @@ class QLlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[object] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
 
         bsz, q_len, _ = hidden_states.size()
         
         hidden_states = hidden_states.reshape(bsz*q_len, -1).contiguous().detach()
-        qx, scale_x, scale = reorder_quantize_x(hidden_states, self.q_reorder_index, self.q_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(hidden_states, self.q_reorder_index, self.q_proj.select_num, self.quant_type, self.kernel_mode)
         torch.cuda.synchronize()
-        
-        hidden_states = (qx, scale_x, scale, bsz, q_len)
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        q_input = (qx, scale_x, scale, bsz, q_len)
+        query_states = self.q_proj(q_input).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(q_input).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(q_input).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         # kv_seq_len = key_states.shape[-2]
         # if past_key_value is not None:
@@ -313,18 +378,23 @@ class QLlamaAttention(nn.Module):
         
         # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         if position_embeddings is None:
+            if self.rotary_emb is None:
+                raise AttributeError(
+                    "QLlamaAttention.rotary_emb is None. Your transformers version keeps rotary_emb on the model (not on Attention). "
+                    "Please inject it from model.rotary_emb when building ARCQuant layers."
+                )
             cos, sin = self.rotary_emb(value_states, position_ids)
-         
         else:
             cos, sin = position_embeddings
         # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         # [bsz, nh, t, hd]
 
-        if past_key_value is not None:
+        pkv = past_key_values if past_key_values is not None else past_key_value
+        if pkv is not None:
             # reuse k, v, self_attention
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = pkv.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # past_key_value = (key_states, value_states) if use_cache else None
 
@@ -361,7 +431,7 @@ class QLlamaAttention(nn.Module):
         attn_output = attn_output.reshape(bsz*q_len, -1).contiguous().detach()
 
 
-        qx, scale_x, scale = reorder_quantize_x(attn_output, self.o_reorder_index, self.o_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(attn_output, self.o_reorder_index, self.o_proj.select_num, self.quant_type, self.kernel_mode)
         torch.cuda.synchronize()
         attn_output = (qx, scale_x, scale, bsz, q_len)
         attn_output = self.o_proj(attn_output)
@@ -369,7 +439,8 @@ class QLlamaAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
         
-        return attn_output, attn_weights, past_key_value
+        pkv_to_return = past_key_values if past_key_values is not None else past_key_value
+        return attn_output, attn_weights, pkv_to_return
     
 
 class QLlamaMLP(nn.Module):
@@ -379,32 +450,39 @@ class QLlamaMLP(nn.Module):
         select_nums,
         reorder_index,
         i,
-        quant_type
+        quant_type,
+        kernel_mode: str = "real",
     ):
         super().__init__()
         nameTemplate = 'layers.{}.{}.{}.{}'
 
         self.quant_type = quant_type
+        self.kernel_mode = kernel_mode.strip().lower()
+        if self.kernel_mode not in {"real", "pseudo"}:
+            raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'real' or 'pseudo'.")
         
         self.gate_proj = QLinearLayer(
             originalMLP.gate_proj,
             select_num=select_nums[nameTemplate.format(i, 'mlp', 'gate_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'gate_proj', 'input')],
             out_reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
-            quant_type=self.quant_type
+            quant_type=self.quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.down_proj = QLinearLayer(
             originalMLP.down_proj,
             select_num=select_nums[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
-            quant_type=self.quant_type
+            quant_type=self.quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.up_proj = QLinearLayer(
             originalMLP.up_proj,
             select_num=select_nums[nameTemplate.format(i, 'mlp', 'up_proj', 'input')],
             reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'up_proj', 'input')],
             out_reorder_index=reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')],
-            quant_type=self.quant_type
+            quant_type=self.quant_type,
+            kernel_mode=self.kernel_mode,
         )
         self.act_fn = originalMLP.act_fn
         self.layer_idx = i
@@ -426,7 +504,7 @@ class QLlamaMLP(nn.Module):
         bsz, q_len, _ = x.shape
         x = x.reshape(bsz*q_len, -1).contiguous().detach()
 
-        qx, scale_x, scale = reorder_quantize_x(x, self.up_reorder_index, self.up_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(x, self.up_reorder_index, self.up_proj.select_num, self.quant_type, self.kernel_mode)
         torch.cuda.synchronize()
         x = (qx, scale_x, scale, bsz, q_len)
         tmpResult = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
@@ -436,7 +514,7 @@ class QLlamaMLP(nn.Module):
         tmpResult = tmpResult.reshape(bsz*q_len, -1).contiguous().detach()
         
 
-        qx, scale_x, scale = reorder_quantize_x(tmpResult, self.down_reorder_index, self.down_proj.select_num, self.quant_type)
+        qx, scale_x, scale = reorder_quantize_x(tmpResult, self.down_reorder_index, self.down_proj.select_num, self.quant_type, self.kernel_mode)
         torch.cuda.synchronize()
         tmpResult = (qx, scale_x, scale, bsz, q_len)
        

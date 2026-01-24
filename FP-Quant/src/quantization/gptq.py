@@ -425,17 +425,12 @@ def gptq_quantization(
                 transform_matrix = get_transform_matrix(args.transform_class, args.hadamard_group_size, device, orig_dtype).cpu()
 
                 if args.export_quantized_model == "realquant":
+                    # Export a single checkpoint that can be used by both real and pseudo kernels.
+                    # - real kernel uses: qweight + scales
+                    # - pseudo kernel uses: dqweight (dequantized from the same quantization params)
                     quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
                         "qweight": pack_fp4_to_uint8(qweight).cpu(),
                         "scales": cast_scales_to_eXmY(scales * weight_global_scale, args.scale_precision).cpu(),
-                        "forward_hadamard_matrix": transform_matrix,
-                        "backward_hadamard_matrix": transform_matrix.clone(),
-                        "weight_global_scale": weight_global_scale.clone(),
-                        "act_global_scale": act_global_scale.clone()
-                    }
-                # pseudoquant
-                else:
-                    quantized_state_dict[f"model.layers.{block_idx}.{layer_name}"] = {
                         "dqweight": dequantized_qweight.cpu(),
                         "forward_hadamard_matrix": transform_matrix,
                         "backward_hadamard_matrix": transform_matrix.clone(),

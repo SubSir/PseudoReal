@@ -65,11 +65,22 @@ def get_reorder_index(model, act_scales, metric='mean'):
 
 
 
-def load_model(model_path):
+def load_model(model_path, device: str | None = None):
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config.use_cache = False
-    kwargs = {"torch_dtype": "auto", "low_cpu_mem_usage": True}
-    model = AutoModelForCausalLM.from_pretrained(model_path, config=config, trust_remote_code=True, **kwargs)
+
+    # transformers 已弃用 torch_dtype 参数名，改用 dtype
+    kwargs = {"dtype": "auto", "low_cpu_mem_usage": True}
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        **kwargs,
+    )
+
+    if device is not None:
+        model.to(device)
+
     model.eval()
     enc = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=False)
     return model, enc
@@ -189,62 +200,27 @@ def get_act_stats(model, dataloader, device_, metric='mean', seqlen=2048, reorde
             )
         )
 
-    layers = model.model.layers
-    model.model.embed_tokens = model.model.embed_tokens.to(device)
-    if hasattr(model.model, 'norm') and not model.model.norm.weight.is_meta:
-        model.model.norm = model.model.norm.to(device)
-    layers[0] = layers[0].to(device)
+    # 对 transformers 新版 Llama（RoPE/position_embeddings 逻辑变化）来说，逐层直接调用 decoder layer
+    # 很容易因为 position_embeddings=None 报错。
+    # 这里改为：仅用整模 forward 触发已注册的 Linear hooks 来统计激活。
 
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=device
-    )
-    cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+    model.to(device)
 
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            hidden_states = inp[0] if isinstance(inp, tuple) else inp
-            inps[cache['i']] = hidden_states.squeeze(0)
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs.get('attention_mask')
-            cache['position_ids'] = kwargs.get('position_ids')
-            raise ValueError
-
-    layers[0] = Catcher(layers[0])
-    
-    if hasattr(model.model, 'rotary_emb'):
-        model.model.rotary_emb = model.model.rotary_emb.to(device)
-    
     for batch in dataloader:
+        input_ids = batch[0].to(device)
+        attention_mask = None
         try:
-            model(batch[0].to(device))
-        except ValueError:
-            pass
-    assert cache['i'] == nsamples, "Captured samples should be equal to nsamples"
-    
-    layers[0] = layers[0].module
-    layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    if hasattr(model.model, 'norm') and not model.model.norm.weight.is_meta:
-        model.model.norm = model.model.norm.cpu()
+            attention_mask = torch.ones_like(input_ids, device=device)
+        except Exception:
+            attention_mask = None
+
+        if attention_mask is not None:
+            model(input_ids, attention_mask=attention_mask)
+        else:
+            model(input_ids)
+
+    model.cpu()
     torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-
-    for i in tqdm(range(len(layers)), desc="Processing layers"):
-        layer = layers[i].to(device)
-        for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        layers[i] = layer.cpu()
-        del layer
-        inps, outs = outs, inps
-        torch.cuda.empty_cache()
-        gc.collect()
 
     for h in hooks:
         h.remove()
@@ -414,43 +390,54 @@ def search_select_proportions(model, dataloader, device_, seqlen, reorder_index)
     layers = model.model.layers
     
     model.to(device)
-    
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=device
-    )
-    cache = {'attention_mask': None}
 
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-            self.self_attn = module.self_attn
-        def forward(self, inp, **kwargs):
-            cache['inps'] = inp
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-    layers[0] = Catcher(layers[0])
+    cache = {}
 
-    dataloader = torch.stack(dataloader, dim=0).squeeze(1)
-    
-    try:
-        model(torch.tensor(dataloader).to(device))
-    except ValueError:
-        pass
-    
-    
-    layers[0] = layers[0].module
-    layers[0] = layers[0].cpu()
+    # 不再用逐层 layer forward（新版 transformers Llama 会要求 position_embeddings，容易触发 NoneType 报错）
+    # 这里直接对每个样本跑一次整模 forward，hooks 会收集每个 Linear 的输入输出激活。
+
+    dataloader = torch.stack(dataloader, dim=0).squeeze(1).to(device)
+
+    total_elements = 0
+    total_bits = 0
+
+    for i in tqdm(range(dataloader.shape[0]), desc="Collecting activations"):
+        act_scales = {}
+        input_ids = dataloader[i : i + 1]
+        attention_mask = torch.ones_like(input_ids, device=device)
+
+        model(input_ids, attention_mask=attention_mask)
+
+        for name, keys in act_scales.items():
+            if 'output' in name:
+                continue
+
+            keys = keys.reshape(-1, keys.shape[-1]).contiguous()
+            _, in_features = keys.shape
+            keys = keys[:, reorder_index[name].to(torch.int32)]
+
+            threshold = keys.max(dim=-1, keepdim=True)[0] * 0.125
+
+            select_ratio = (keys > threshold).sum() / keys.numel()
+            select_num = math.ceil(in_features * select_ratio / 64) * 64
+            average_bits[name] = 4.5 * (in_features + select_num) / in_features
+            total_elements += in_features
+            total_bits += 4.5 * (in_features + select_num)
+            select_nums[name] = select_num
+
+            del keys
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
     model.cpu()
-
     torch.cuda.empty_cache()
 
-    inps = cache['inps']
-  
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    for h in hooks:
+        h.remove()
+
+    print(f'average bits is {(total_bits / total_elements):.2f}')
+    return select_nums, average_bits
 
     total_elements = 0
     total_bits = 0
