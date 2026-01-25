@@ -63,7 +63,7 @@ class QLinearLayer(nn.Module):
                 self.W, self.scale_w, self.scale = NVFP4_reorder_quantize_w(w, reorder_index.to(torch.int16).cuda(), select_num)
                 self.W_fp = None
             else:
-                self.W, self.scale_w, self.scale = fake_reorder_quantize_w(w, torch.arange(self.in_features), select_num, dtype='NVFP4')
+                self.W, self.scale_w, self.scale = fake_reorder_quantize_w(w, reorder_index, select_num, dtype='NVFP4')
                 self.W_fp = self.W
         else:
             self.W, self.scale_w, self.scale = fake_reorder_quantize_w(originalLayer.weight.data, torch.arange(self.in_features), 0, dtype=quant_type)

@@ -65,6 +65,7 @@ def _evaluate(model: nn.Module, tokenizer, *, batch_size: int) -> dict:
     results = lm_eval.simple_evaluate(
         model=lm,
         tasks=["arc_easy", "arc_challenge", "hellaswag", "boolq"],
+        # tasks=["boolq"],
         num_fewshot=0,
         device="cuda:0" if torch.cuda.is_available() else "cpu",
     )
@@ -120,10 +121,22 @@ def _load_fp_quant_model(
     device: str,
     dtype: torch.dtype,
 ) -> tuple[nn.Module, AutoTokenizer | None]:
-    # Load config and keep export quantization metadata
+    # 约定：
+    # - --model 传“base model”（HF repo 或本地原始模型目录）
+    # - FP-Quant 导出目录写死为 ./export_fpquant/llama3-8b-nvfp4-gptq
+    export_dir = os.path.join(
+        os.path.dirname(__file__),
+        "export_fpquant",
+        "llama3-8b-nvfp4-gptq",
+    )
+
+    # 目标：
+    # 1) base model 用 transformers 正常 load
+    # 2) 读取 export_dir 的 quantization_config + safetensors(state_dict)
+    # 3) Linear -> FPQuantLinear，然后用量化 state_dict 覆盖
     from transformers import AutoConfig
 
-    cfg_full = AutoConfig.from_pretrained(model_path)
+    cfg_full = AutoConfig.from_pretrained(export_dir)
     export_qcfg = getattr(cfg_full, "quantization_config", None)
     if export_qcfg is None:
         raise ValueError(
@@ -131,30 +144,64 @@ def _load_fp_quant_model(
             "Please re-export with FP-Quant export enabled."
         )
 
-    # Avoid transformers auto-quantization during load
+    # 避免 transformers 自动走 fp_quant integration（会在 load 过程中触发 pre_forward/cpu）
     delattr(cfg_full, "quantization_config")
 
     fpq_config = _build_fp_quant_config_from_hf_config(export_qcfg, kernel_mode=kernel_mode)
 
-    # Build model directly on target device (single-GPU, no meta/accelerate).
-    model = AutoModelForCausalLM.from_config(cfg_full)
+    # 1) load base model（原始 fp 权重）
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=dtype,
+        device_map=None,
+        low_cpu_mem_usage=True,
+    )
     model.to(device)
     model.eval()
 
-    # Replace Linear -> FPQuantLinear on-device
+    # 2) 替换 Linear -> FPQuantLinear
     model = replace_quantize_with_fp_quant_linear(model, fp_quant_linear_config=fpq_config)
 
-    # Load exported weights (qweight/scales/dqweight/...) into the replaced modules
+    # 3) load 导出目录的 safetensors（量化参数）并覆盖
     state_dict = {}
-    shard_paths = [
-        os.path.join(model_path, f"model-{i}-of-4.safetensors") for i in range(1, 5)
-    ]
-    for sp in shard_paths:
-        if not os.path.isfile(sp):
-            raise FileNotFoundError(f"Missing shard: {sp}")
-        state_dict.update(load_file(sp))
+    index_path = os.path.join(export_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        import json
 
-    model.load_state_dict(state_dict, strict=False)
+        with open(index_path, "r") as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
+        shard_files = sorted(set(weight_map.values()))
+        if len(shard_files) == 0:
+            raise ValueError(f"Empty weight_map in index: {index_path}")
+        for sf in shard_files:
+            sp = os.path.join(export_dir, sf)
+            if not os.path.isfile(sp):
+                raise FileNotFoundError(f"Missing shard referenced by index: {sp}")
+            state_dict.update(load_file(sp))
+    else:
+        shard_files = [
+            fn
+            for fn in os.listdir(export_dir)
+            if fn.endswith(".safetensors") and fn.startswith("model")
+        ]
+        if len(shard_files) == 0:
+            raise FileNotFoundError(f"No .safetensors shards found under: {export_dir}")
+        for fn in sorted(shard_files):
+            state_dict.update(load_file(os.path.join(export_dir, fn)))
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    if len(unexpected) > 0:
+        print(
+            "[fp_quant] Warning: unexpected keys when loading exported state_dict (first 20 shown):\n"
+            + "\n".join(unexpected[:20])
+        )
+    if len(missing) > 0:
+        print(
+            "[fp_quant] Warning: missing keys after loading exported state_dict (first 20 shown):\n"
+            + "\n".join(missing[:20])
+        )
 
     finalize_master_weights(model)
     model.eval()
