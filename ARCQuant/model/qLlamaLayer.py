@@ -89,10 +89,9 @@ def reorder_quantize_x(x, reorder_index, select_num, quant_type='NVFP4', kernel_
 
     if quant_type == 'NVFP4' and kernel_mode == "pseudo":
         index = reorder_index.to(torch.int32)
-        return fake_reorder_quantize_x(torch.index_select(x, 1, index), index, select_num, dtype='NVFP4')
+        return fake_reorder_quantize_x((x), index, select_num, dtype='NVFP4')
 
-    index = reorder_index.to(torch.int32)
-    return fake_reorder_quantize_x(torch.index_select(x, 1, index), index, 0, dtype=quant_type)
+    raise NotImplementedError(f"Invalid quant_type: {quant_type}. Expected 'NVFP4'.")
     # return fake_reorder_quantize_x(torch.index_select(x, 1, index), torch.arange(x.shape[-1]), select_num, dtype=quant_type)
 
 class QLlamaDecoderLayer(nn.Module):

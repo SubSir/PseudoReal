@@ -85,7 +85,6 @@ def replace_quantize_with_fp_quant_linear(
         current_key_name.append(name)
 
         if isinstance(module, nn.Linear):
-            # Check if the current key is not in the `quantization_config.modules_to_not_convert`
             current_key_name_str = ".".join(current_key_name)
             if not any(
                 current_key_name_str.endswith(key)
@@ -105,14 +104,12 @@ def replace_quantize_with_fp_quant_linear(
                 model._modules[name].weight.data = module.weight.data
                 if module.bias is not None:
                     model._modules[name].bias.data = module.bias.data
-                model._modules[name].pre_forward()
         if len(list(module.children())) > 0:
             _ = replace_quantize_with_fp_quant_linear(
                 module,
                 fp_quant_linear_config=fp_quant_linear_config,
                 current_key_name=current_key_name,
             )
-        # Remove the last key for recursion
         current_key_name.pop(-1)
     return model
 
@@ -133,7 +130,12 @@ def finalize_master_weights(
                 model._modules[name].config.store_master_weights = (
                     False  # all FPQuantLinear share the same config obj
                 )
-            model._modules[name].pre_forward()
+            if getattr(module, "qweight", None) is None and module.weight is None:
+                raise ValueError(
+                    f"FPQuantLinear has neither `weight` nor `qweight` loaded for module: {'.'.join(current_key_name)}"
+                )
+            if module.weight is not None or getattr(module, "qweight", None) is not None:
+                model._modules[name].pre_forward()
 
         if len(list(module.children())) > 0:
             finalize_master_weights(

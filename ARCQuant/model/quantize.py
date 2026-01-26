@@ -222,11 +222,11 @@ def quantize_mxfp6_tensor(tensor, group_size=32):
 
 def fake_reorder_quantize_w(w, reorder_index, select_num, dtype='NVFP4'):
     
-    scale = torch.max(w).float() / (448.0*6.0)
+    scale = torch.max(w.abs()).float() / (448.0*6.0)
     quantize_func = quantize_nvfp4_tensor
     
     if dtype == "NVFP4":
-        scale = torch.max(w).float() / (448.0*6.0)
+        scale = torch.max(w.abs()).float() / (448.0*6.0)
         quantize_func = quantize_nvfp4_tensor
     elif dtype == "MXFP4":
         scale = 1.0
@@ -246,11 +246,11 @@ def fake_reorder_quantize_w(w, reorder_index, select_num, dtype='NVFP4'):
 
 def fake_reorder_quantize_x(x, reorder_index, select_num, dtype='NVFP4'):
     
-    scale = torch.max(x).float() / (448.0*6.0)
+    scale = torch.max(x.abs()).float() / (448.0*6.0)
     quantize_func = quantize_nvfp4_tensor
     
     if dtype == "NVFP4":
-        scale = torch.max(x).float() / (448.0*6.0)
+        scale = torch.max(x.abs()).float() / (448.0*6.0)
         quantize_func = quantize_nvfp4_tensor
     elif dtype == "MXFP4":
         scale = 1.0
@@ -269,7 +269,7 @@ def fake_reorder_quantize_x(x, reorder_index, select_num, dtype='NVFP4'):
         q_x = quantize_func(x)
         error_e = x - q_x
         q_error_k = quantize_func(error_e[:, topk_index])
-        return torch.cat([q_x, q_error_k], dim=1) * scale, scale_x, scale
+        return torch.cat([q_x, q_error_k], dim=1), scale_x, scale
 
 def hadamard_transform(x, normalize=True, block_size=-1):
     n = x.shape[-1]

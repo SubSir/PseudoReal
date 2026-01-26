@@ -150,13 +150,15 @@ def _load_fp_quant_model(
     fpq_config = _build_fp_quant_config_from_hf_config(export_qcfg, kernel_mode=kernel_mode)
 
     # 1) load base model（原始 fp 权重）
+    # 为了避免 load_state_dict 时在 GPU 上分配大量 buffer 导致峰值显存 OOM，这里先在 CPU 上完成：
+    #   load(base fp) -> replace -> load(export sd)
+    # 最后再整体搬到目标 device 并 finalize。
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=dtype,
-        device_map=None,
+        dtype=dtype,
+        device_map="cpu",
         low_cpu_mem_usage=True,
     )
-    model.to(device)
     model.eval()
 
     # 2) 替换 Linear -> FPQuantLinear
@@ -190,6 +192,32 @@ def _load_fp_quant_model(
         for fn in sorted(shard_files):
             state_dict.update(load_file(os.path.join(export_dir, fn)))
 
+    def _remap_llama_export_keys(export_sd: dict[str, torch.Tensor], model_sd_keys: set[str]) -> dict[str, torch.Tensor]:
+        # Llama 结构对齐：优先匹配 "model.layers.{i}." 后面的后缀。
+        # 导出通常是 "model.layers..."；base model 有时会带额外前缀（如 "base_model.model.layers..."）。
+        mapped = {}
+        extra_prefix = None
+        for k in model_sd_keys:
+            if k.endswith("model.layers.0.self_attn.q_proj.weight"):
+                extra_prefix = k[: -len("model.layers.0.self_attn.q_proj.weight")]
+                break
+        if extra_prefix is None:
+            # fallback: 找任意包含 model.layers.0. 的 key
+            for k in model_sd_keys:
+                pos = k.find("model.layers.0.")
+                if pos != -1:
+                    extra_prefix = k[:pos]
+                    break
+        for k, v in export_sd.items():
+            if extra_prefix is not None and k.startswith("model.layers."):
+                kk = extra_prefix + k
+            else:
+                kk = k
+            mapped[kk] = v
+        return mapped
+
+    state_dict = _remap_llama_export_keys(state_dict, set(model.state_dict().keys()))
+
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
     if len(unexpected) > 0:
@@ -202,6 +230,11 @@ def _load_fp_quant_model(
             "[fp_quant] Warning: missing keys after loading exported state_dict (first 20 shown):\n"
             + "\n".join(missing[:20])
         )
+
+    # 4) 搬到目标 device 后再 finalize（pre_forward 会把 fp weight 置空，从而释放大头显存）
+    model.to(device)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     finalize_master_weights(model)
     model.eval()

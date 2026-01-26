@@ -16,6 +16,10 @@ pip install --no-build-isolation -e .
 cd ARCQuant/kernels
 bash remake.sh
 
+cd ../../FP-Quant/inference_lib
+pip install -e .
+cd ../../
+
 export OMP_NUM_THREADS=8
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
 
@@ -39,7 +43,7 @@ python FP-Quant/model_quant.py \
 
 python non_reasoning.py \
   --backend fp_quant \
-  --model ./export_fpquant/llama3-8b-nvfp4-gptq \
+  --model SubSir/Meta-Llama-3-8B \
   --kernel-1 real \
   --kernel-2 pseudo
 

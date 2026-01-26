@@ -106,46 +106,30 @@ class FPQuantLinear(nn.Module):
 
 
         # Quantized tensors buffers
+        # NOTE: allocate tiny CPU placeholders here to avoid GPU OOM spikes during state_dict loading.
+        # Real qweight/scales will be materialized in pre_forward().
         if self.config.forward_dtype == FPQuantDtype.MXFP4:
             self.register_buffer(
                 "qweight",
-                torch.empty(
-                    self.weight.shape[0],
-                    self.weight.shape[1] // 2,
-                    dtype=torch.uint8,
-                    device=self.weight.device,
-                ),
+                torch.empty(0, dtype=torch.uint8, device="cpu"),
             )
             self.register_buffer(
                 "scales",
-                torch.empty(
-                    self.weight.shape[0],
-                    self.weight.shape[1] // 32,
-                    dtype=torch.uint8,
-                    device=self.weight.device,
-                ),
+                torch.empty(0, dtype=torch.uint8, device="cpu"),
             )
         elif self.config.forward_dtype == FPQuantDtype.NVFP4:
             self.register_buffer(
                 "qweight",
-                torch.empty(
-                    self.weight.shape[0],
-                    self.weight.shape[1] // 2,
-                    dtype=torch.uint8,
-                    device=self.weight.device,
-                ),
+                torch.empty(0, dtype=torch.uint8, device="cpu"),
             )
             self.register_buffer(
                 "scales",
-                torch.empty(
-                    self.weight.shape[0],
-                    self.weight.shape[1] // 16,
-                    dtype=torch.uint8,
-                    device=self.weight.device,
-                ),
+                torch.empty(0, dtype=torch.uint8, device="cpu"),
             )
         else:
-            raise ValueError(f"Unsupported forward dtype: {config.forward_dtype}")
+            raise ValueError(f"Unsupported forward dtype: {self.config.forward_dtype}")
+
+        factory_kwargs = {"device": self.weight.device, "dtype": self.weight.dtype}
 
         # Global scale buffers
         self.register_buffer(
@@ -253,14 +237,14 @@ class FPQuantLinear(nn.Module):
             self.dqweight = None
         elif self.config.pseudoquantization:
             if not self._prefer_exported_dqweight:
-            weight_dq, _ = forward_pseudoquantize(
-                self.weight.data,
-                self.forward_hadamard_matrix,
-                self.weight_global_scale,
-                self.config.forward_dtype,
-                self.config.forward_method,
-            )
-            self.dqweight = nn.Parameter(weight_dq, requires_grad=False)
+                weight_dq, _ = forward_pseudoquantize(
+                    self.weight.data,
+                    self.forward_hadamard_matrix,
+                    self.weight_global_scale,
+                    self.config.forward_dtype,
+                    self.config.forward_method,
+                )
+                self.dqweight = nn.Parameter(weight_dq, requires_grad=False)
             self.weight = None
             self.qweight = None
             self.scales = None
