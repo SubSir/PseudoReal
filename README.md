@@ -114,9 +114,9 @@ python non_reasoning.py \
 
 Batch size: `16`
 
-### fp_quant
+### four over six
 
-| kernel | arc_challenge (4/6) | arc_easy | boolq | hellaswag |
+| kernel | arc_challenge | arc_easy | boolq | hellaswag |
 | --- | ---: | ---: | ---: | ---: |
 | pseudo | 48.72 | 77.78 | 77.22 | 58.29 |
 | real | 48.38 | 77.65 | 77.34 | 58.38 |
