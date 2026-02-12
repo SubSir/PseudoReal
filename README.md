@@ -1,34 +1,52 @@
 ## Setup
 
-### Install & Build
+### Option A: Lightweight Setup (Pseudo Mode Only)
+If you only need to run the **pseudo** (fake quantization) path to verify accuracy or logic without compiling custom CUDA kernels, follow these steps:
 
 ```bash
-# 1) Point CUTLASS_DIR to your local CUTLASS checkout (replace with your path)
-export CUTLASS_DIR=~/cutlass
-
-# 2) Install Python dependencies (run from the repo root)
+# 1) Install Python dependencies
 pip install -r requirements.txt
 
-# 3) Build/install fouroversix (run from the repo root)
+# 2) Install fouroversix (without building kernels)
+export SKIP_CUDA_BUILD=1
 cd fouroversix
-export CUDA_ARCHS=120
-export FORCE_BUILD=1
 pip install --no-build-isolation -e .
 cd ..
 
-# 4) Build ARCQuant kernels (run from the repo root)
-cd ARCQuant/kernels
-bash remake.sh
-cd ../..
-
-# 5) Install FP-Quant inference_lib (run from the repo root)
+# 3) Install FP-Quant inference_lib
 cd FP-Quant/inference_lib
 pip install -e .
 cd ../..
 
-# 6) Recommended runtime env vars
-export OMP_NUM_THREADS=8
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128"
+# Note: You can skip ARCQuant/kernels and CUTLASS_DIR setup.
+```
+
+### Option B: Full Setup (Real Kernels + Pseudo)
+Required for running `real` kernel mode for performance benchmarking.
+
+```bash
+# 1) Point CUTLASS_DIR to your local CUTLASS checkout
+export CUTLASS_DIR=~/cutlass
+
+# 2) Install Python dependencies
+pip install -r requirements.txt
+
+# 3) Build/install fouroversix with kernels
+cd fouroversix
+export CUDA_ARCHS=120 # Adjust for your GPU (e.g., 80 for A100, 90 for H100)
+export FORCE_BUILD=1
+pip install --no-build-isolation -e .
+cd ..
+
+# 4) Build ARCQuant kernels
+cd ARCQuant/kernels
+bash remake.sh
+cd ../..
+
+# 5) Install FP-Quant inference_lib
+cd FP-Quant/inference_lib
+pip install -e .
+cd ../..
 ```
 
 ### FP-Quant: Export a Quantized Model (Example)

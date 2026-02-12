@@ -361,16 +361,21 @@ def main():
             return QuantizeBackend.pytorch
         return QuantizeBackend(v)
 
-    def _parse_kernel_mode(val: str) -> str:
+    def _parse_kernel_mode(val: str | None) -> str | None:
+        if val is None or val.lower() == "none":
+            return None
         v = val.strip().lower()
         if v in {"real", "kernel", "kernels"}:
             return "real"
         if v in {"pseudo", "ref", "reference"}:
             return "pseudo"
-        raise ValueError(f"Invalid kernel mode: {val}. Expected 'real' or 'pseudo'.")
+        raise ValueError(f"Invalid kernel mode: {val}. Expected 'real', 'pseudo' or 'none'.")
 
     kernel1 = _parse_kernel_mode(args.kernel_1)
     kernel2 = _parse_kernel_mode(args.kernel_2)
+
+    if kernel1 is None:
+        raise ValueError("kernel-1 cannot be None. At least one kernel must be specified.")
 
     # Only used when backend=4o6
     backend1 = _parse_backend(kernel1)
@@ -412,6 +417,10 @@ def main():
     del model1
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if kernel2 is None:
+        print("Run 2: skipped (kernel-2 is None)")
+        return
 
     print("Run 2: loading model...")
     if args.backend == "fp_quant":
