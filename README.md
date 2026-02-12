@@ -112,7 +112,7 @@ python non_reasoning.py \
 
 ## Results
 
-Batch size: `16`
+Batch size: `8`
 
 ### four over six
 
