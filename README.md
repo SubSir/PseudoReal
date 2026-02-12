@@ -13,7 +13,13 @@ cd fouroversix
 pip install --no-build-isolation -e .
 cd ..
 
-# 3) Install FP-Quant inference_lib
+# 3) Install fast-hadamard-transform (required by FP-Quant, for both pseudo and real)
+git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
+cd fast-hadamard-transform
+pip install --no-build-isolation -e .
+cd ..
+
+# 4) Install FP-Quant inference_lib
 cd FP-Quant/inference_lib
 pip install -e .
 cd ../..
@@ -43,7 +49,13 @@ cd ARCQuant/kernels
 bash remake.sh
 cd ../..
 
-# 5) Install FP-Quant inference_lib
+# 5) Install fast-hadamard-transform (required by FP-Quant, for both pseudo and real)
+git clone https://github.com/Dao-AILab/fast-hadamard-transform.git
+cd fast-hadamard-transform
+pip install --no-build-isolation -e .
+cd ..
+
+# 6) Install FP-Quant inference_lib
 cd FP-Quant/inference_lib
 pip install -e .
 cd ../..
