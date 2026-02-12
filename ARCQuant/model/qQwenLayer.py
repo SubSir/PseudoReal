@@ -12,7 +12,11 @@ import sys
 _KERNEL_BUILD_DIR = os.path.join(os.path.dirname(__file__), "..", "kernels", "build")
 if _KERNEL_BUILD_DIR not in sys.path:
     sys.path.append(_KERNEL_BUILD_DIR)
-import agemm 
+
+try:
+    import agemm 
+except ImportError:
+    agemm = None
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
