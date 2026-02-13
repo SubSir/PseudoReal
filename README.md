@@ -116,24 +116,26 @@ Batch size: `8`
 
 ### four over six
 
-| kernel | arc_challenge | arc_easy | boolq | hellaswag |
-| --- | ---: | ---: | ---: | ---: |
-| pseudo | 48.72 | 77.78 | 77.22 | 58.29 |
-| real | 48.38 | 77.65 | 77.34 | 58.38 |
+| device | kernel | arc_challenge | arc_easy | boolq | hellaswag |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 5090 | pseudo | 48.72 | 77.78 | 77.22 | 58.29 |
+| 5090 | real   | 48.38 | 77.65 | 77.34 | 58.38 |
+| A100 | pseudo | 47.61 | 77.27 | 75.98 | 59.00 |
 
 ### arc_quant
 
-| kernel | arc_challenge | arc_easy | boolq | hellaswag |
-| --- | ---: | ---: | ---: | ---: |
-| pseudo | 47.61 | 78.16 | 77.98 | 58.46 |
-| real | 47.18 | 78.33 | 80.00 | 58.166 |
+| device | kernel | arc_challenge | arc_easy | boolq | hellaswag |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 5090 | pseudo | 47.61 | 78.16 | 77.98 | 58.46 |
+| 5090 | real   | 47.18 | 78.33 | 80.00 | 58.17 |
+| A100 | pseudo | 50.17 | 78.70 | 78.04 | 58.48 |
 
 ### mr-gptq
 
-| kernel | arc_challenge | arc_easy | boolq | hellaswag |
-| --- | ---: | ---: | ---: | ---: |
-| pseudo | 46.50 | 78.16 | 76.73 | 58.23 |
-| real | 44.37 | 77.02 | 73.55 | 57.76 |
+| device | kernel | arc_challenge | arc_easy | boolq | hellaswag |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 5090 | pseudo | 46.50 | 78.16 | 76.73 | 58.23 |
+| 5090 | real   | 44.37 | 77.02 | 73.55 | 57.76 |
 
 ## Pseudo vs Real: GEMM Data Type Behavior (Implementation Notes)
 
