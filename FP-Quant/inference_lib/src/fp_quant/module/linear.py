@@ -59,10 +59,6 @@ class FPQuantLinear(nn.Module):
                 "QuTLASS is not installed. Can only run with `pseudoquantization=True` in the quantization config. If you have a Blackwell GPU, you can install QuTLASS from https://github.com/IST-DASLab/QuTLASS"
             )
 
-        # If we are in pseudo mode and loading from an exported checkpoint, we may want to keep
-        # the exported dqweight (instead of recomputing it in pre_forward).
-        self._prefer_exported_dqweight = False
-
         factory_kwargs = {"device": device, "dtype": dtype}
         self.in_features = in_features
         self.out_features = out_features
@@ -79,57 +75,47 @@ class FPQuantLinear(nn.Module):
 
         self.config = config
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-
-        # If checkpoint provides dqweight, and we are in pseudo mode, keep it and skip recomputation.
-        dq_key = prefix + "dqweight"
-        if self.config.pseudoquantization and dq_key in state_dict:
-            self._prefer_exported_dqweight = True
-
-
         # Quantized tensors buffers
-        # NOTE: allocate tiny CPU placeholders here to avoid GPU OOM spikes during state_dict loading.
-        # Real qweight/scales will be materialized in pre_forward().
         if self.config.forward_dtype == FPQuantDtype.MXFP4:
             self.register_buffer(
                 "qweight",
-                torch.empty(0, dtype=torch.uint8, device="cpu"),
+                torch.empty(
+                    self.weight.shape[0],
+                    self.weight.shape[1] // 2,
+                    dtype=torch.uint8,
+                    device=self.weight.device,
+                ),
             )
             self.register_buffer(
                 "scales",
-                torch.empty(0, dtype=torch.uint8, device="cpu"),
+                torch.empty(
+                    self.weight.shape[0],
+                    self.weight.shape[1] // 32,
+                    dtype=torch.uint8,
+                    device=self.weight.device,
+                ),
             )
         elif self.config.forward_dtype == FPQuantDtype.NVFP4:
             self.register_buffer(
                 "qweight",
-                torch.empty(0, dtype=torch.uint8, device="cpu"),
+                torch.empty(
+                    self.weight.shape[0],
+                    self.weight.shape[1] // 2,
+                    dtype=torch.uint8,
+                    device=self.weight.device,
+                ),
             )
             self.register_buffer(
                 "scales",
-                torch.empty(0, dtype=torch.uint8, device="cpu"),
+                torch.empty(
+                    self.weight.shape[0],
+                    self.weight.shape[1] // 16,
+                    dtype=torch.uint8,
+                    device=self.weight.device,
+                ),
             )
         else:
-            raise ValueError(f"Unsupported forward dtype: {self.config.forward_dtype}")
-
-        factory_kwargs = {"device": self.weight.device, "dtype": self.weight.dtype}
+            raise ValueError(f"Unsupported forward dtype: {config.forward_dtype}")
 
         # Global scale buffers
         self.register_buffer(
@@ -164,7 +150,6 @@ class FPQuantLinear(nn.Module):
                 **factory_kwargs,
             ),
         )
-
 
     @torch.no_grad()
     def pre_forward(self):
@@ -236,15 +221,14 @@ class FPQuantLinear(nn.Module):
             self.scales = None
             self.dqweight = None
         elif self.config.pseudoquantization:
-            if not self._prefer_exported_dqweight:
-                weight_dq, _ = forward_pseudoquantize(
-                    self.weight.data,
-                    self.forward_hadamard_matrix,
-                    self.weight_global_scale,
-                    self.config.forward_dtype,
-                    self.config.forward_method,
-                )
-                self.dqweight = nn.Parameter(weight_dq, requires_grad=False)
+            weight_dq, _ = forward_pseudoquantize(
+                self.weight.data,
+                self.forward_hadamard_matrix,
+                self.weight_global_scale,
+                self.config.forward_dtype,
+                self.config.forward_method,
+            )
+            self.dqweight = nn.Parameter(weight_dq, requires_grad=False)
             self.weight = None
             self.qweight = None
             self.scales = None

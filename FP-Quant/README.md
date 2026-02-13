@@ -163,13 +163,9 @@ fi
 export WANDB_PROJECT="FP-Quantization-Harness"
 export WANDB_NAME=${MODEL}/${FORMAT}-w${W_BITS}-a${A_BITS}-${METHOD_NAME}-${TRANSFORM_CLASS}-transform
 
-if [[ $EXPORT_QUANTIZATION == "realquant" || $EXPORT_QUANTIZATION == "pseudoquant" ]]; then
-    SCRIPT_ARGS="${SCRIPT_ARGS} --export_quantized_model ${EXPORT_QUANTIZATION}"
-    if [[ $EXPORT_QUANTIZATION == "realquant" ]]; then
-        SAVE_DIR=quantized_models
-    else
-        SAVE_DIR=pseudoquantized_models
-    fi
+if [[ $EXPORT_QUANTIZATION == 1 ]]; then
+    SCRIPT_ARGS="${SCRIPT_ARGS} --export_quantized_models"
+    SAVE_DIR=quantized_models
 fi
 
 python model_quant.py \
@@ -190,7 +186,7 @@ python model_quant.py \
     --dtype=${DTYPE} \
     --lm_eval_batch_size=${LM_EVAL_BATCH_SIZE} \
     --save_path "${SAVE_DIR}/${MODEL_ID}-${FORMAT}-w${W_BITS}-a${A_BITS}-${METHOD_NAME}-${TRANSFORM_CLASS}-transform" \
-    --export_quantized_model pseudoquant \
+    --export_quantized_models \
     --cpu_offload_activations \
     --cpu_offload_modules \
     --fuse_global_scale \
@@ -217,7 +213,7 @@ Above:
 * `--sequence_length` - Calibration sequence length.
 * `--dtype` - Data type to load the model.
 * `--amp` - Whether to use automatic mixed precision.
-* `--export_quantized_model` - Whether to export quantized model in `realquant` or `pseudoquant` format. The former allows one to run quantized model with the help of [QuTLASS](https://github.com/IST-DASLab/qutlass) integration, while the latter produces fake quantized model runnable with `triton` kernels.
+* `--export_quantized_models` - Whether to export both `realquant` and `pseudoquant` formats. The models will be saved in `<save_path>/realquant` and `<save_path>/pseudoquant` respectively. `realquant` allows one to run quantized model with the help of [QuTLASS](https://github.com/IST-DASLab/qutlass) integration, while `pseudoquant` produces fake quantized model runnable with `triton` kernels.
 
 For evaluation, we provide the following options:
 

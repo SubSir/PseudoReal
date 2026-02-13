@@ -124,11 +124,12 @@ def _load_fp_quant_model(
     # 约定：
     # - --model 传“base model”（HF repo 或本地原始模型目录）
     # - FP-Quant 导出目录写死为 ./export_fpquant/llama3-8b-nvfp4-gptq
-    export_dir = os.path.join(
+    export_root = os.path.join(
         os.path.dirname(__file__),
         "export_fpquant",
         "llama3-8b-nvfp4-gptq",
     )
+    export_dir = os.path.join(export_root, "pseudoquant" if kernel_mode == "pseudo" else "realquant")
 
     # 目标：
     # 1) base model 用 transformers 正常 load
@@ -149,19 +150,24 @@ def _load_fp_quant_model(
 
     fpq_config = _build_fp_quant_config_from_hf_config(export_qcfg, kernel_mode=kernel_mode)
 
+    def _load_to_device(path, device):
+        sd = load_file(path)
+        return {k: v.to(device) for k, v in sd.items()}
+
     # 1) load base model（原始 fp 权重）
     # 为了避免 load_state_dict 时在 GPU 上分配大量 buffer 导致峰值显存 OOM，这里先在 CPU 上完成：
     #   load(base fp) -> replace -> load(export sd)
     # 最后再整体搬到目标 device 并 finalize。
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        dtype=dtype,
-        device_map="cpu",
+        torch_dtype=dtype,
+        device_map=None,
         low_cpu_mem_usage=True,
     )
+    model.to(device)
     model.eval()
 
-    # 2) 替换 Linear -> FPQuantLinear
+    # 2) 替换 Linear -> FPQuantLinear (此时模型已经在 GPU 上)
     model = replace_quantize_with_fp_quant_linear(model, fp_quant_linear_config=fpq_config)
 
     # 3) load 导出目录的 safetensors（量化参数）并覆盖
@@ -180,7 +186,7 @@ def _load_fp_quant_model(
             sp = os.path.join(export_dir, sf)
             if not os.path.isfile(sp):
                 raise FileNotFoundError(f"Missing shard referenced by index: {sp}")
-            state_dict.update(load_file(sp))
+            state_dict.update(_load_to_device(sp, device))
     else:
         shard_files = [
             fn
@@ -190,7 +196,7 @@ def _load_fp_quant_model(
         if len(shard_files) == 0:
             raise FileNotFoundError(f"No .safetensors shards found under: {export_dir}")
         for fn in sorted(shard_files):
-            state_dict.update(load_file(os.path.join(export_dir, fn)))
+            state_dict.update(_load_to_device(os.path.join(export_dir, fn), device))
 
     def _remap_llama_export_keys(export_sd: dict[str, torch.Tensor], model_sd_keys: set[str]) -> dict[str, torch.Tensor]:
         # Llama 结构对齐：优先匹配 "model.layers.{i}." 后面的后缀。
@@ -231,12 +237,6 @@ def _load_fp_quant_model(
             + "\n".join(missing[:20])
         )
 
-    # 4) 搬到目标 device 后再 finalize（pre_forward 会把 fp weight 置空，从而释放大头显存）
-    model.to(device)
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    finalize_master_weights(model)
     model.eval()
     return model, None
 

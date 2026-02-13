@@ -75,7 +75,7 @@ python FP-Quant/model_quant.py \
   --w_group_size 16 --a_group_size 16 \
   --transform_class hadamard \
   --hadamard_group_size 16 \
-  --export_quantized_model realquant \
+  --export_quantized_model \
   --save_path ./export_fpquant/llama3-8b-nvfp4-gptq \
   --cpu_offload_activations \
   --cpu_offload_modules \
@@ -134,8 +134,8 @@ Batch size: `8`
 
 | device | kernel | arc_challenge | arc_easy | boolq | hellaswag |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 5090 | pseudo | 46.50 | 78.16 | 76.73 | 58.23 |
-| 5090 | real   | 44.37 | 77.02 | 73.55 | 57.76 |
+| 5090 | real   | 46.16 | 77.53 | 76.67 | 58.41 |
+| 5090 | pseudo | 46.76 | 77.19 | 76.42 | 58.29 |
 
 ## Pseudo vs Real: GEMM Data Type Behavior (Implementation Notes)
 

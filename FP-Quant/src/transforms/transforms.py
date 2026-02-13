@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from fast_hadamard_transform import hadamard_transform
 
-
 from .matrix import (
     GeneralMatrix,
     OrthogonalMatrix,

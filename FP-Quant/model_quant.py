@@ -11,9 +11,6 @@ import lm_eval
 from lm_eval.utils import make_table
 from lm_eval.models.huggingface import HFLM
 
-from inference_lib.src.fp_quant.utils.config import FPQuantConfig, FPQuantDtype
-from inference_lib.src.fp_quant.utils.replace import replace_with_fp_quant_linear, finalize_master_weights
-
 from src.metrics.perplexity import compute_perplexity
 from src.transforms.transforms import TRANSFORMS
 from src.quantization.quant_ops import NVFP_GROUPSIZE, MXFP_GROUPSIZE
@@ -41,10 +38,11 @@ def auto_or_int(value):
         raise argparse.ArgumentTypeError(f"Must be 'auto' or an integer, got '{value}'")
 
 
-def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args):
+def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, export_type="realquant"):
     config = model.config
     # Prepare directory to save model
-    os.makedirs(args.save_path, exist_ok=True)
+    save_path = os.path.join(args.save_path, export_type)
+    os.makedirs(save_path, exist_ok=True)
 
     blocks = model.model.layers
 
@@ -103,23 +101,23 @@ def export_quantized_model(model, quantized_state_dict, non_quantized_state_dict
     # Save shards
     for shard_idx, shard in enumerate(shards):
         current_shard_path = f"model-{str(shard_idx+1).zfill(max_digits)}-of-{str(num_shards).zfill(max_digits)}.safetensors"
-        save_file(shard, os.path.join(args.save_path, current_shard_path))
+        save_file(shard, os.path.join(save_path, current_shard_path))
         for k in shard:
             safetensors_index[k] = current_shard_path
 
     # Save safetensors index
-    with open(os.path.join(args.save_path, "model.safetensors.index.json"), "w") as f:
+    with open(os.path.join(save_path, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {}, "weight_map": safetensors_index}, f)
 
     # Add quantization metadata
     config.quantization_config = prepare_quantization_config(
         args.hadamard_group_size, 
         args.format,
-        pseudoquantization=False
+        pseudoquantization=(export_type == "pseudoquant")
     )
     # Save configs
-    config.save_pretrained(args.save_path)
-    model.generation_config.save_pretrained(args.save_path)
+    config.save_pretrained(save_path)
+    model.generation_config.save_pretrained(save_path)
 
     
 def parse_args():
@@ -219,15 +217,8 @@ def parse_args():
     )
     parser.add_argument(
         "--export_quantized_model",
-        type=str,
-        default="",
-        choices=["", "realquant"],
-        help="Whether export quantized model (single-weight export: always realquant).",
-    )
-    parser.add_argument(
-        "--use_real_kernel",
         action="store_true",
-        help="Whether to use real kernel for evaluation (only takes effect when loading exported model).",
+        help="Whether to export quantized model in BOTH realquant and pseudoquant formats.",
     )
     # GPTQ params
     parser.add_argument(
@@ -351,62 +342,10 @@ def parse_args():
     return args
 
 
-def _kernel_mode_to_pseudoquantization(kernel_mode: str) -> bool:
-    if kernel_mode == "pseudo":
-        return True
-    if kernel_mode == "real":
-        return False
-    raise ValueError(f"Invalid kernel_mode: {kernel_mode}. Expected 'pseudo' or 'real'.")
-
-
-def _build_fp_quant_config_from_hf_config(hf_config, kernel_mode: str) -> FPQuantConfig:
-    if not hasattr(hf_config, "quantization_config") or hf_config.quantization_config is None:
-        raise ValueError("Model config has no `quantization_config`. Did you load an exported FP-Quant model?")
-
-    qcfg = hf_config.quantization_config
-    forward_dtype_str = qcfg.get("forward_dtype")
-    if forward_dtype_str == "mxfp4":
-        forward_dtype = FPQuantDtype.MXFP4
-    elif forward_dtype_str == "nvfp4":
-        forward_dtype = FPQuantDtype.NVFP4
-    else:
-        raise ValueError(f"Unsupported forward_dtype in quantization_config: {forward_dtype_str}")
-
-    return FPQuantConfig(
-        forward_dtype=forward_dtype,
-        forward_method=qcfg.get("forward_method", "abs_max"),
-        backward_dtype=FPQuantDtype.BF16,
-        store_master_weights=False,
-        hadamard_group_size=qcfg.get("hadamard_group_size", 128),
-        pseudoquantization=_kernel_mode_to_pseudoquantization(kernel_mode),
-        modules_to_not_convert=qcfg.get("modules_to_not_convert", ["lm_head"]),
-        transform_init="hadamard",
-    )
-
-
-def _maybe_enable_fp_quant_kernels(model, kernel_mode: str):
-    # 仅对已导出（带 quantization_config）的模型启用 inference_lib 的 FPQuantLinear
-    if not hasattr(model.config, "quantization_config") or model.config.quantization_config is None:
-        return model
-
-    fpq_config = _build_fp_quant_config_from_hf_config(model.config, kernel_mode=kernel_mode)
-    model, _ = replace_with_fp_quant_linear(model, fp_quant_linear_config=fpq_config)
-    finalize_master_weights(model)
-    return model
-
-
-def main():
-    args = parse_args()
-    # Fix seed
+def run_quantization_and_export(args, device, export_type=None):
+    # Fix seed to ensure reproducibility
     fix_seed(args.seed)
-    # Set device
-    device = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
-    # Get dtype
-    if args.dtype != "auto":
-        args.dtype = getattr(torch, args.dtype)
-    # Init logger
-    if args.log_wandb:
-        wandb.init(config=args)
+    
     # Model
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path, 
@@ -414,10 +353,6 @@ def main():
         device_map=None if args.cpu_offload_modules else device,
         low_cpu_mem_usage=True,
     )
-
-    # If loading an exported FP-Quant model, enable pseudo/real kernel for evaluation via a unified path.
-    kernel_mode = "real" if args.use_real_kernel else "pseudo"
-    model = _maybe_enable_fp_quant_kernels(model, kernel_mode=kernel_mode)
     model.config.use_cache = False
     model.requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -446,14 +381,54 @@ def main():
     )
 
     if quantize_anything:
+        # Override args.export_quantized_model temporarily for the library calls
+        original_export_setting = args.export_quantized_model
+        args.export_quantized_model = export_type if export_type else ""
+        
         if args.gptq:
             quantized_state_dict, non_quantized_state_dict = gptq_quantization(model, calibration_data, args, device)
         else:
             quantized_state_dict, non_quantized_state_dict = rtn_quantization(model, calibration_data, args, device)
 
-        if args.export_quantized_model:
-            export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args) 
-            tokenizer.save_pretrained(args.save_path)
+        if export_type:
+            export_quantized_model(model, quantized_state_dict, non_quantized_state_dict, args, export_type=export_type) 
+            tokenizer.save_pretrained(os.path.join(args.save_path, export_type))
+        
+        # Restore original setting
+        args.export_quantized_model = original_export_setting
+
+    return model, tokenizer
+
+
+def main():
+    args = parse_args()
+    # Set device
+    device = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+    # Get dtype
+    if args.dtype != "auto":
+        args.dtype = getattr(torch, args.dtype)
+    # Init logger
+    if args.log_wandb:
+        wandb.init(config=args)
+
+    if args.export_quantized_model:
+        print("Starting dual quantization export (realquant and pseudoquant)...")
+        # 1. First run: realquant
+        print("\n--- Running Real Quantization ---")
+        model, tokenizer = run_quantization_and_export(args, device, export_type="realquant")
+        
+        # Cleanup to free VRAM before second run
+        del model
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 2. Second run: pseudoquant
+        print("\n--- Running Pseudo Quantization ---")
+        model, tokenizer = run_quantization_and_export(args, device, export_type="pseudoquant")
+    else:
+        # Normal run without dual export
+        model, tokenizer = run_quantization_and_export(args, device, export_type=None)
 
     if args.compile:
         model = torch.compile(model)
