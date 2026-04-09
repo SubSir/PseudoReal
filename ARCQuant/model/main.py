@@ -1,7 +1,7 @@
 import torch
 from collections import defaultdict
 
-from model_utils import reorder_model_llama, reorder_model_qwen
+from model_utils import reorder_model_llama, reorder_model_qwen, reorder_model_qwen3
 from parallel_utils import map_layers_to_multi_gpus
 from datautils import get_loaders
 from eval import *
@@ -100,6 +100,10 @@ if __name__ == '__main__':
         model = get_llama(args.model)
         reorder_model_func = reorder_model_llama
        
+    elif "qwen3" in args.model.lower():
+        model = get_qwen(args.model)
+        reorder_model_func = reorder_model_qwen3
+
     elif "qwen" in args.model.lower():
         model = get_qwen(args.model)
         reorder_model_func = reorder_model_qwen

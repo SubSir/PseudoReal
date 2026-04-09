@@ -301,3 +301,8 @@ template void run_rmsnorm_x_bf16_nvfp4<16, 3584>(
   bf16_t*, bf16_t*, float, int, int16_t*, uint8_t*,
   sf_t*, int, int
 );
+
+template void run_rmsnorm_x_bf16_nvfp4<16, 12288>(
+  bf16_t*, bf16_t*, float, int, int16_t*, uint8_t*,
+  sf_t*, int, int
+);

@@ -231,8 +231,8 @@ def get_act_stats(model, dataloader, device_, metric='mean', seqlen=2048, reorde
 
 def get_wikitext2(nsamples, seed, seqlen, tokenizer):
     from datasets import load_dataset
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    traindata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='train')
+    testdata = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='test')
     trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
   
     import random

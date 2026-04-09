@@ -4,11 +4,13 @@ import torch.nn as nn
 from tqdm import tqdm
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
 
 from qLinearLayer import find_qlinear_layers
 from qLlamaLayer import QLlamaDecoderLayer
 from qQwenLayer import QQwen2DecoderLayer
+from qQwen3Layer import QQwen3DecoderLayer
 
 
 from functools import partial
@@ -74,8 +76,39 @@ def reorder_model_qwen(model, device, kv_cache, reorder_index, select_nums, quan
         m.mlp.register_buffer('down_reorder_index', reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')].to(torch.int16))
         m.self_attn.register_buffer('q_reorder_index', reorder_index[nameTemplate.format(i, 'self_attn', 'q_proj', 'input')].to(torch.int16))
         m.self_attn.register_buffer('o_reorder_index', reorder_index[nameTemplate.format(i, 'self_attn', 'o_proj', 'input')].to(torch.int16))
-        layers[i] = layers[i].cpu()
-        layers[i] = m.cpu()
+        # Keep quantized Qwen3 layers on the target device to avoid CPU/CUDA mismatch
+        # (e.g. RMSNorm weights on CPU while hidden_states are on CUDA during eval).
+        layers[i] = m.to(device)
+        del m
+        torch.cuda.empty_cache()
+    return model
+
+
+def reorder_model_qwen3(model, device, kv_cache, reorder_index, select_nums, quant_type, kernel_mode: str = "real"):
+    model.config.use_cache = False
+    layers = model.model.layers
+    assert reorder_index is not None, "Reorder index is None"
+
+    for i in tqdm(range(len(layers))):
+        layers[i] = layers[i].to(device)
+        if isinstance(layers[i], Qwen3DecoderLayer):
+            m = QQwen3DecoderLayer(
+                original_layer=layers[i],
+                kv_cache=kv_cache,
+                select_nums=select_nums,
+                reorder_index=reorder_index,
+                layer_idx=i,
+                quant_type=quant_type,
+                kernel_mode=kernel_mode,
+            )
+
+        nameTemplate = 'layers.{}.{}.{}.{}'
+        m.mlp.register_buffer('up_reorder_index', reorder_index[nameTemplate.format(i, 'mlp', 'up_proj', 'input')].to(torch.int16))
+        m.mlp.register_buffer('down_reorder_index', reorder_index[nameTemplate.format(i, 'mlp', 'down_proj', 'input')].to(torch.int16))
+        m.self_attn.register_buffer('q_reorder_index', reorder_index[nameTemplate.format(i, 'self_attn', 'q_proj', 'input')].to(torch.int16))
+        m.self_attn.register_buffer('o_reorder_index', reorder_index[nameTemplate.format(i, 'self_attn', 'o_proj', 'input')].to(torch.int16))
+        # Keep quantized Qwen3 layers on the target device to avoid CPU/CUDA mismatch.
+        layers[i] = m.to(device)
         del m
         torch.cuda.empty_cache()
     return model

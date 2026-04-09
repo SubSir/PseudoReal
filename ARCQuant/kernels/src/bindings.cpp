@@ -98,6 +98,13 @@ std::tuple<torch::Tensor, torch::Tensor> reorder_quantize_x(
             KQ, KE
         );
     }
+    else if (KQ == 12288) { // Qwen3 MLP down_proj input
+        run_reorder_x_bf16_nvfp4<16, 12288>(
+            (cutlass::bfloat16_t *)X.data_ptr<at::BFloat16>(), M, reorder_index.data_ptr<int16_t>(), 
+            QX.data_ptr<uint8_t>(), reinterpret_cast<cutlass::float_ue4m3_t *>(SFX.data_ptr<uint8_t>()), 
+            KQ, KE
+        );
+    }
     else if (KQ == 3584) { // Qwen
         run_reorder32_x_bf16_nvfp4<32, 3584>(
             (cutlass::bfloat16_t *)X.data_ptr<at::BFloat16>(), M, reorder_index.data_ptr<int16_t>(), 
@@ -186,6 +193,13 @@ std::tuple<torch::Tensor, torch::Tensor> reorder_quantize_w(
             KQ, KE
         );
     }
+    else if (KQ == 12288) { // Qwen3 MLP down_proj input
+        run_reorder_w_bf16_nvfp4<16, 12288>(
+            (cutlass::bfloat16_t *)W.data_ptr<at::BFloat16>(), N, reorder_index.data_ptr<int16_t>(), 
+            QW.data_ptr<uint8_t>(), reinterpret_cast<cutlass::float_ue4m3_t *>(SFW.data_ptr<uint8_t>()), 
+            KQ, KE
+        );
+    }
     else if (KQ == 3584) { //Qwen
         run_reorder32_w_bf16_nvfp4<32, 3584>(
             (cutlass::bfloat16_t *)W.data_ptr<at::BFloat16>(), N, reorder_index.data_ptr<int16_t>(), 
@@ -260,6 +274,14 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_quantize_x(
     }
     else if (KQ == 3584) { // Qwen
         run_rmsnorm_x_bf16_nvfp4<16, 3584>(
+            (cutlass::bfloat16_t *)X.data_ptr<at::BFloat16>(), (cutlass::bfloat16_t *)W.data_ptr<at::BFloat16>(), eps, 
+            M, reorder_index.data_ptr<int16_t>(), 
+            QX.data_ptr<uint8_t>(), reinterpret_cast<cutlass::float_ue4m3_t *>(SFX.data_ptr<uint8_t>()), 
+            KQ, KE
+        );
+    }
+    else if (KQ == 12288) { // optional support for larger hidden size
+        run_rmsnorm_x_bf16_nvfp4<16, 12288>(
             (cutlass::bfloat16_t *)X.data_ptr<at::BFloat16>(), (cutlass::bfloat16_t *)W.data_ptr<at::BFloat16>(), eps, 
             M, reorder_index.data_ptr<int16_t>(), 
             QX.data_ptr<uint8_t>(), reinterpret_cast<cutlass::float_ue4m3_t *>(SFX.data_ptr<uint8_t>()), 

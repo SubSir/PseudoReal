@@ -265,7 +265,7 @@ def _apply_arcquant(
     if arc_model_dir not in sys.path:
         sys.path.append(arc_model_dir)
 
-    from model_utils import reorder_model_llama, reorder_model_qwen  # type: ignore
+    from model_utils import reorder_model_llama, reorder_model_qwen, reorder_model_qwen3  # type: ignore
 
     model_name = model_path.rstrip("/").split("/")[-1]
     dataset_name = dataset.lower()
@@ -291,6 +291,8 @@ def _apply_arcquant(
 
     if "llama" in model_path.lower():
         reorder_model_func = reorder_model_llama
+    elif "qwen3" in model_path.lower():
+        reorder_model_func = reorder_model_qwen3
     elif "qwen" in model_path.lower():
         reorder_model_func = reorder_model_qwen
     else:
