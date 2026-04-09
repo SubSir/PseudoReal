@@ -60,12 +60,17 @@ def load_model(
     return model, export_qcfg
 
 
-def _evaluate(model: nn.Module, tokenizer, *, batch_size: int) -> dict:
+def _evaluate(
+    model: nn.Module,
+    tokenizer,
+    *,
+    batch_size: int,
+    tasks: list[str],
+) -> dict:
     lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
     results = lm_eval.simple_evaluate(
         model=lm,
-        tasks=["arc_easy", "arc_challenge", "hellaswag", "boolq"],
-        # tasks=["boolq"],
+        tasks=tasks,
         num_fewshot=0,
         device="cuda:0" if torch.cuda.is_available() else "cpu",
     )
@@ -337,8 +342,17 @@ def main():
         type=str,
         help="Kernel mode for run 2: real or pseudo.",
     )
+    parser.add_argument(
+        "--tasks",
+        type=str,
+        default="arc_easy,arc_challenge,hellaswag,boolq",
+        help="Comma-separated lm_eval task names (e.g. arc_challenge,arc_easy,boolq,hellaswag or mmlu).",
+    )
 
     args = parser.parse_args()
+    task_list = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    if not task_list:
+        raise ValueError("--tasks must list at least one lm_eval task.")
 
     torch.set_grad_enabled(False)
     random.seed(args.seed)
@@ -411,7 +425,7 @@ def main():
         raise ValueError(f"Unknown backend: {args.backend}")
 
     print("Run 1: evaluating...")
-    results1 = _evaluate(model1, tokenizer, batch_size=args.batch_size)
+    results1 = _evaluate(model1, tokenizer, batch_size=args.batch_size, tasks=task_list)
     print({"run": 1, "backend": args.backend, "kernel": kernel1, "results": results1})
 
     del model1
@@ -451,7 +465,7 @@ def main():
         raise ValueError(f"Unknown backend: {args.backend}")
 
     print("Run 2: evaluating...")
-    results2 = _evaluate(model2, tokenizer, batch_size=args.batch_size)
+    results2 = _evaluate(model2, tokenizer, batch_size=args.batch_size, tasks=task_list)
     print({"run": 2, "backend": args.backend, "kernel": kernel2, "results": results2})
 
 
